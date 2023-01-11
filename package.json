@@ -4,7 +4,7 @@
     "access": "public",
     "@shopify:registry": "https://registry.npmjs.org/"
   },
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "",
   "main": "index.ts",
   "keywords": [],
