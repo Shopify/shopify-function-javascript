@@ -1,5 +1,9 @@
 {
   "name": "@shopify/shopify_function",
+  "publishConfig": {
+    "access": "public",
+    "@shopify:registry": "https://registry.npmjs.org/"
+  },
   "version": "0.0.1",
   "description": "",
   "main": "index.ts",
