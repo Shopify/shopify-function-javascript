@@ -1,4 +1,4 @@
-# Shopify Function JavaScript
+# Shopify Function JavaScript :D
 
 This repository contains the source code for the [`@shopify/shopify_function`][package] npm package.
 
