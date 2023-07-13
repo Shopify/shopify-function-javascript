@@ -16,5 +16,8 @@
     "@graphql-codegen/typescript-operations": "^2.5.5",
     "graphql": "^16.6.0",
     "typescript": "^4.8.4"
+  },
+  "peerDependencies": {
+    "javy": "^0.1.0"
   }
 }
