@@ -11,7 +11,7 @@
   "author": "Surma <surma@shopify.com>",
   "license": "Apache-2.0",
   "dependencies": {
-    "@graphql-codegen/cli": "^2.13.7",
+    "@graphql-codegen/cli": "^5.0.4",
     "@graphql-codegen/typescript": "^2.8.0",
     "@graphql-codegen/typescript-operations": "^4.4.1",
     "graphql": "^16.6.0",
