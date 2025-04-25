@@ -14,7 +14,9 @@ declare global {
 export default function <I extends {}, O extends {}>(
   userfunction: UserFunction<I, O>
 ) {
-  if (!ShopifyFunction) {
+  try {
+    ShopifyFunction;
+  } catch (e) {
     throw new Error(
       "ShopifyFunction is not defined. Please rebuild your function using the latest version of Shopify CLI."
     );
