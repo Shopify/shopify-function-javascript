@@ -13,9 +13,14 @@ jobs:
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v4
-
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
       - name: Create snapshot version
         uses: Shopify/snapit@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        with:
+          build_script: echo "hello"
+          working_directory: ./
