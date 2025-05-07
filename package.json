@@ -18,5 +18,8 @@
     "@graphql-tools/url-loader": "8.0.16",
     "graphql": "16.11.0",
     "typescript": "5.8.3"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.28.1" 
   }
 }
