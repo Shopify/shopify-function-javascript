@@ -1,23 +1,28 @@
-export type ShopifyFunction<Input extends {}, Output extends {}> = (
+export type UserFunction<Input extends {}, Output extends {}> = (
   input: Input
 ) => Output;
 
-interface Javy {
-  JSON: {
-    fromStdin(): any;
-    toStdout(val: any);
-  }
+interface ShopifyFunction {
+  readInput(): any;
+  writeOutput(val: any);
 }
 
 declare global {
-  const Javy: Javy;
+  const ShopifyFunction: ShopifyFunction;
 }
 
-export default function <I extends {}, O extends {}>(userfunction: ShopifyFunction<I, O>) {
-  if (!Javy.JSON) {
-    throw new Error('Javy.JSON is not defined. Please rebuild your function using the latest version of Shopify CLI.');
+export default function <I extends {}, O extends {}>(
+  userfunction: UserFunction<I, O>
+) {
+  try {
+    ShopifyFunction;
+  } catch (e) {
+    throw new Error(
+      "ShopifyFunction is not defined. Please rebuild your function using the latest version of Shopify CLI."
+    );
   }
-  const input_obj = Javy.JSON.fromStdin();
+
+  const input_obj = ShopifyFunction.readInput();
   const output_obj = userfunction(input_obj);
-  Javy.JSON.toStdout(output_obj)
+  ShopifyFunction.writeOutput(output_obj);
 }
