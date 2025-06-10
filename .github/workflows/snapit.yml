@@ -17,7 +17,7 @@ jobs:
         with:
           version: 10
       - name: Create snapshot version
-        uses: Shopify/snapit@main
+        uses: Shopify/snapit@v0.0.14
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
