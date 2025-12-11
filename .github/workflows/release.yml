@@ -19,18 +19,18 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-          cache: yarn
+          cache: npm
 
       - name: Update npm to latest
         run: npm install -g npm@latest
 
       - name: Install dependencies
-        run: yarn install
+        run: npm install
 
       - name: Create Release Pull Request or Publish
         uses: changesets/action@v1 # Must use latest version!
         with:
-          publish: yarn release
+          publish: npm release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Keep this
           NPM_TOKEN: "" # Forces OIDC authentication
