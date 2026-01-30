@@ -4,12 +4,16 @@
     "access": "public",
     "@shopify:registry": "https://registry.npmjs.org/"
   },
-  "version": "2.0.1",
+  "version": "2.0.0",
   "description": "",
   "main": "index.ts",
   "keywords": [],
   "author": "Surma <surma@shopify.com>",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shopify/shopify-function-javascript.git"
+  },
   "dependencies": {
     "@graphql-codegen/cli": "5.0.6",
     "@graphql-codegen/typescript": "4.1.6",
