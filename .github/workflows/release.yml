@@ -31,7 +31,7 @@ jobs:
       - name: Create Release Pull Request or Publish
         uses: changesets/action@v1 # Must use latest version!
         with:
-          publish: changeset publish
+          publish: npx changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Keep this
           NPM_TOKEN: "" # Forces OIDC authentication
