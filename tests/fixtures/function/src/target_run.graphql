@@ -1,0 +1,8 @@
+query TargetRunInput($filter: LineFilter!, $country: CountryCode, $first: Int = 10) {
+  cart {
+    lines(filter: $filter, country: $country, first: $first) {
+      id
+      deliveryMethod
+    }
+  }
+}

@@ -1,0 +1,52 @@
+schema {
+  query: Input
+  mutation: MutationRoot
+}
+
+scalar JSON
+scalar Void
+
+enum CountryCode {
+  CA
+  US
+}
+
+enum DeliveryMethod {
+  SHIPPING
+  PICK_UP
+}
+
+input LineFilter {
+  titles: [String!]
+  country: CountryCode
+}
+
+type CartLine {
+  id: ID!
+  deliveryMethod: DeliveryMethod
+}
+
+type Cart {
+  lines(filter: LineFilter, country: CountryCode, first: Int): [CartLine!]!
+}
+
+type Input {
+  cart: Cart!
+}
+
+"""
+The result of the prepare target: the variables for the run target's input query.
+"""
+input FunctionTargetPrepareResult {
+  variables: JSON!
+}
+
+input FunctionTargetRunResult {
+  lineCount: Int!
+  deliveryMethod: DeliveryMethod
+}
+
+type MutationRoot {
+  targetPrepare(result: FunctionTargetPrepareResult!): Void!
+  targetRun(result: FunctionTargetRunResult!): Void!
+}
