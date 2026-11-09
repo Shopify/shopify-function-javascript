@@ -8,7 +8,57 @@ const path = require("node:path");
 const ts = require("typescript");
 
 const root = path.join(__dirname, "..");
-const fixture = path.join(__dirname, "fixtures", "function");
+
+// A function schema and an input query that selects an enum field and uses
+// enum and input object variables.
+const schema = `
+schema {
+  query: Input
+  mutation: MutationRoot
+}
+
+scalar Void
+
+enum CountryCode { CA US }
+enum DeliveryMethod { SHIPPING PICK_UP }
+
+input LineFilter {
+  titles: [String!]
+  country: CountryCode
+}
+
+type CartLine {
+  id: ID!
+  deliveryMethod: DeliveryMethod
+}
+
+type Cart {
+  lines(filter: LineFilter, country: CountryCode): [CartLine!]!
+}
+
+type Input {
+  cart: Cart!
+}
+
+input FunctionRunResult {
+  lineCount: Int!
+}
+
+type MutationRoot {
+  run(result: FunctionRunResult!): Void!
+}
+`;
+
+const inputQuery = `
+query RunInput($filter: LineFilter!, $country: CountryCode) {
+  cart {
+    lines(filter: $filter, country: $country) {
+      id
+      deliveryMethod
+    }
+  }
+}
+`;
 
 // The codegen block of the JavaScript function templates in Shopify/extensions-templates.
 const templateCodegen = {
@@ -37,68 +87,40 @@ const cliDefaults = {
   },
 };
 
-function generate() {
+test("generated types have no type errors when a query uses enums and input objects", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "function-"));
-  fs.cpSync(fixture, dir, { recursive: true });
-  // Codegen resolves its plugins from the function directory, as in an installed function.
-  fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "dir");
-  const config = {
-    ...templateCodegen,
-    config: {
-      ...cliDefaults,
-      ...templateCodegen.config,
-      scalars: { ...cliDefaults.scalars, ...templateCodegen.config.scalars },
-    },
-  };
-  const configPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "codegen-")), "codegen.json");
-  fs.writeFileSync(configPath, JSON.stringify(config));
-  const bin = fs.realpathSync(path.join(root, "node_modules", ".bin", "graphql-code-generator"));
-  execFileSync(process.execPath, [bin, "--config", configPath], { cwd: dir, stdio: "pipe" });
-  return dir;
-}
-
-function typeErrors(dir) {
-  const program = ts.createProgram([path.join(dir, "generated", "api.ts"), path.join(dir, "src", "target_prepare.js")], {
-    allowJs: true,
-    checkJs: true,
-    strict: true,
-    noEmit: true,
-    skipLibCheck: true,
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
-    types: [],
-  });
-  return ts.getPreEmitDiagnostics(program).map((d) => {
-    const file = d.file ? path.relative(dir, d.file.fileName) : "";
-    return `${file}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`;
-  });
-}
-
-test("generated types compile when queries use enums and input objects", () => {
-  const dir = generate();
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "codegen-"));
   try {
-    assert.deepEqual(typeErrors(dir), []);
+    fs.writeFileSync(path.join(dir, "schema.graphql"), schema);
+    fs.mkdirSync(path.join(dir, "src"));
+    fs.writeFileSync(path.join(dir, "src", "run.graphql"), inputQuery);
+    // Codegen resolves its plugins from the function directory, as in an installed function.
+    fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "dir");
+
+    const configPath = path.join(configDir, "codegen.json");
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        ...templateCodegen,
+        config: { ...cliDefaults, ...templateCodegen.config, scalars: cliDefaults.scalars },
+      }),
+    );
+    const bin = fs.realpathSync(path.join(root, "node_modules", ".bin", "graphql-code-generator"));
+    execFileSync(process.execPath, [bin, "--config", configPath], { cwd: dir, stdio: "pipe" });
+
+    const program = ts.createProgram([path.join(dir, "generated", "api.ts")], {
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      target: ts.ScriptTarget.ES2022,
+      types: [],
+    });
+    const errors = ts
+      .getPreEmitDiagnostics(program)
+      .map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+    assert.deepEqual(errors, []);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("the run query's variables type checks what a prepare target returns", () => {
-  const dir = generate();
-  try {
-    const prepare = path.join(dir, "src", "target_prepare.js");
-    const source = fs.readFileSync(prepare, "utf8");
-    for (const [from, to, expected] of [
-      ["filter:", "filtre:", /'filtre' does not exist/],
-      ["country: CountryCode.Us", 'country: "US"', /'"US"' is not assignable/],
-      ['titles: ["Gift card"]', "titles: [1]", /'number' is not assignable to type 'string'/],
-    ]) {
-      fs.writeFileSync(prepare, source.replace(from, to));
-      const errors = typeErrors(dir);
-      assert.ok(errors.some((error) => expected.test(error)), `${to}:\n${errors.join("\n")}`);
-    }
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
   }
 });

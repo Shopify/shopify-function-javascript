@@ -1,7 +1,0 @@
-query TargetPrepareInput {
-  cart {
-    lines {
-      id
-    }
-  }
-}
