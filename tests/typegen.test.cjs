@@ -17,6 +17,9 @@ type CartLine { id: ID! }
 type Input { id: ID!, lines(selector: LineSelector!, first: Int): [CartLine!]! }
 input FunctionTargetPrepareResult { variables: JSON! }
 input FunctionTargetRunResult { lineCount: Int! }
+input OptionalVariables { variables: JSON }
+input VariablesList { variables: [JSON!]! }
+input VariablesChoice @oneOf { variables: JSON, none: Boolean }
 type MutationRoot {
   "Handles the Function result for the test.target.prepare target."
   targetPrepare(result: FunctionTargetPrepareResult!): Void!
@@ -72,7 +75,7 @@ function runTypegen(t, { files, fnTargets = targets, config = {}, queryFiles = q
   return { dir, status: result.status, stderr: result.stderr, types: fs.existsSync(api) ? fs.readFileSync(api, "utf8") : undefined };
 }
 
-test("passes variables the run query accepts, generating the types with this package's plugins rather than the function's", (t) => {
+test("passes variables the run query accepts, typing them with this package's plugins rather than the function's", (t) => {
   // Plugins that work, as another version installed in the function would, but mark the output
   const other = 'exports.plugin = () => "// the function\'s plugin";';
   const fn = runTypegen(t, {
@@ -81,6 +84,8 @@ test("passes variables the run query accepts, generating the types with this pac
   });
   assert.equal(fn.status, 0, fn.stderr);
   assert.doesNotMatch(fn.types, /the function's plugin/);
+  assert.match(fn.types, /variables: Scalars\['FunctionTargetPrepareResultVariables'\]\['input'\]/);
+  assert.match(fn.types, /FunctionTargetPrepareResultVariables: \{ input: TargetRunInputVariables;/);
   assert.match(fn.types, /export type TargetRunInputVariables = /);
 });
 
@@ -98,7 +103,7 @@ test("fails when a prepare target returns variables its run query doesn't accept
     ].join("\n"),
   );
   // The types are still generated, for editors
-  assert.match(fn.types, /export type TargetRunInputVariables = /);
+  assert.match(fn.types, /FunctionTargetPrepareResultVariables/);
 });
 
 test("without prepare targets, generates the same types as the typescript and typescript-operations plugins", async (t) => {
@@ -106,6 +111,40 @@ test("without prepare targets, generates the same types as the typescript and ty
   assert.equal(fn.status, 0, fn.stderr);
   const [plain] = await generate({ ...codegenConfig({}), cwd: fn.dir, silent: true, pluginLoader: require }, false);
   assert.equal(fn.types, plain.content);
+});
+
+test("applies customScalarOverrides from the config, keeping lists, nullability and oneOf variants", (t) => {
+  const fn = runTypegen(t, {
+    files: prepare('{ selector: { id: "gid://shopify/CartLine/1" } }'),
+    config: {
+      customScalarOverrides: {
+        "FunctionTargetPrepareResult.variables": "Record<string, string>",
+        "OptionalVariables.variables": "TargetRunInputVariables",
+        "VariablesList.variables": "TargetRunInputVariables",
+        "VariablesChoice.variables": "TargetRunInputVariables",
+      },
+    },
+  });
+  assert.equal(fn.status, 0, fn.stderr);
+  for (const line of [
+    "FunctionTargetPrepareResultVariables: { input: Record<string, string>;",
+    "variables?: InputMaybe<Scalars['OptionalVariablesVariables']['input']>;",
+    "variables: Array<Scalars['VariablesListVariables']['input']>;",
+    "{ none?: never; variables: Scalars['VariablesChoiceVariables']['input']; }",
+  ]) {
+    assert.ok(fn.types.includes(line), line);
+  }
+});
+
+test("fails when an override isn't a custom scalar field of an input object", (t) => {
+  const fn = runTypegen(t, {
+    files: prepare("{}"),
+    fnTargets: [targets[1]],
+    config: { customScalarOverrides: { "Input.id": "TargetRunInputVariables", "FunctionTargetRunResult.lineCount": "TargetRunInputVariables" } },
+  });
+  assert.equal(fn.status, 1);
+  assert.match(fn.stderr, /"Input\.id" isn't a field of an input object\./);
+  assert.match(fn.stderr, /"FunctionTargetRunResult\.lineCount" is Int!, not a custom scalar\./);
 });
 
 test("fails when codegen fails", (t) => {

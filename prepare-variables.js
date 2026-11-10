@@ -339,4 +339,4 @@ function prepareVariablesErrors({ directory, entry: entryPath, schema: schemaPat
   return [...errors];
 }
 
-module.exports = { prepareVariablesErrors };
+module.exports = { preparePairs, prepareVariablesErrors };
