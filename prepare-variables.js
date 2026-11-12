@@ -42,6 +42,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     return [{ message: "The function has no entry file, such as src/index.js, to check its prepare targets in", warning: false }];
   }
   const entry = path.resolve(directory, entryPath);
+  // Paths in messages use forward slashes, as Shopify CLI's do, on Windows too
+  const relative = (file) => path.relative(directory, file).split(path.sep).join("/");
 
   const schema = buildSchema(fs.readFileSync(path.resolve(directory, schemaPath), "utf8"));
   const options = {
@@ -54,11 +56,13 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
+    // An element of an array, like `list[0]`, can be undefined
+    noUncheckedIndexedAccess: true,
   };
   const host = ts.createCompilerHost(options, true);
   // Annotations and casts are claims nothing checks against the value (`@ts-ignore` silences the compiler), so they're
-  // blanked out of the function's own files, leaving types to come from the values. Parameter types are kept. Blanking
-  // keeps positions, so errors point at the original source.
+  // blanked out of the function's own files, leaving types to come from the values. Parameter types and non-null
+  // assertions (`!`, like Rust's `unwrap`) are kept. Blanking keeps positions, so errors point at the original source.
   const { getSourceFile } = host;
   host.getSourceFile = (fileName, language, ...rest) => {
     const file = getSourceFile(fileName, language, ...rest);
@@ -73,7 +77,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
           ts.isJSDocTypeTag(tag) || ts.isJSDocReturnTag(tag) || ts.isJSDocSatisfiesTag(tag) || ts.isJSDocOverloadTag(tag);
         if (typing && !ts.isParameter(tag.parent.parent)) blank(tag.pos, tag.end);
       }
-      if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isNonNullExpression(node)) {
+      if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) {
         blank(node.expression.end, node.end);
       } else if (ts.isTypeAssertionExpression(node)) {
         blank(node.type.pos - 1, node.expression.pos);
@@ -110,7 +114,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     if (muted) return;
     const file = node.getSourceFile();
     const { line, character } = file.getLineAndCharacterOfPosition(node.getStart());
-    problems.set(`${path.relative(directory, file.fileName)}:${line + 1}:${character + 1} ${message}`, warning);
+    problems.set(`${relative(file.fileName)}:${line + 1}:${character + 1} ${message}`, warning);
   };
   const join = (base, key) => (base ? `${base}.${key}` : key);
   const subject = (at) => (at ? `\`${at}\`` : "The result");
@@ -144,7 +148,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     if (assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return;
     const name = ts.isPropertyAccessExpression(access) ? access.name : access.argumentExpression;
     const key = ts.isIdentifier(name) || ts.isStringLiteralLike(name) ? name.text : undefined;
-    return key === undefined ? undefined : { key, name, value: assignment.right };
+    return key === undefined ? undefined : { key, name, value: assignment.right, node: assignment };
   };
 
   const changes = (reference) => {
@@ -173,7 +177,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
 
   for (const { name, query } of pairs) {
     const queryPath = path.resolve(directory, query);
-    const queryName = path.relative(directory, queryPath);
+    const queryName = relative(queryPath);
     const operation = parse(fs.readFileSync(queryPath, "utf8")).definitions.find(
       (definition) => definition.kind === Kind.OPERATION_DEFINITION,
     );
@@ -197,6 +201,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     const visiting = new Set();
     const changed = new Map();
     const assigned = new Map();
+    const passed = new Map();
 
     // The variable an object literal property is written in, such as `variables` in `const variables = {a: 1}`
     const bindingOf = (property) => {
@@ -254,7 +259,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
           (checker.isArrayType(type) || checker.isTupleType(type)) && checker.getIndexTypeOfType(type, ts.IndexKind.Number);
         return element ? typed(element, inner.ofType, `${at}[]`, false, node) : typed(type, inner.ofType, at, false, node);
       }
-      if (isInputObjectType(inner) && type.flags & ts.TypeFlags.Object && !checker.isArrayType(type)) {
+      // An intersection, such as what Object.assign returns, is checked like an object
+      if (isInputObjectType(inner) && (type.flags & ts.TypeFlags.Object || type.isIntersection()) && !checker.isArrayType(type)) {
         if (checker.getIndexInfosOfType(type).length > 0) {
           return report(node, `${subject(at)} can have any keys, so it can't be checked`, true);
         }
@@ -268,9 +274,15 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
             followed.set(declaration, at);
             bindings.add(declaration);
           }
+          const spreadType = checker.getTypeAtLocation(spread.expression);
+          if (unchecked(spreadType) || checker.getIndexInfosOfType(spreadType).length > 0) {
+            return report(spread, `${subject(at)} spreads an object that can have any keys, so it can't be checked`, true);
+          }
         }
         if ([...bindings].map((binding) => skipChanged(binding, at, node)).some(Boolean)) return;
         const fields = inner.getFields();
+        // A oneOf input object takes exactly one of its fields, which can't be null
+        const fieldType = (field) => (inner.isOneOf ? new GraphQLNonNull(field.type) : field.type);
         const assignments = [...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? [];
         const assignedKeys = new Set(assignments.map((assignment) => assignment.key));
         for (const property of properties) {
@@ -279,8 +291,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
           const field = fields[property.name];
           const key = join(at, property.name);
           // A property written in an object literal is followed to its value, keeping literal types (like an enum
-          // value) that the object's type widens
-          const declaration = property.valueDeclaration;
+          // value) that the object's type widens. A key written twice has its last value.
+          const declaration = property.declarations?.at(-1) ?? property.valueDeclaration;
           const assignment =
             declaration && (ts.isPropertyAssignment(declaration) || ts.isShorthandPropertyAssignment(declaration))
               ? declaration
@@ -291,21 +303,28 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
             const binding = bindingOf(property);
             if (binding) followed.set(binding, at);
             const initializer = ts.isPropertyAssignment(assignment) ? assignment.initializer : assignment.name;
-            value(initializer, field.type, key, field.defaultValue !== undefined);
+            value(initializer, fieldType(field), key, field.defaultValue !== undefined);
           } else {
-            typed(checker.getTypeOfSymbol(property), field.type, key, field.defaultValue !== undefined, node);
+            typed(checker.getTypeOfSymbol(property), fieldType(field), key, field.defaultValue !== undefined, node);
           }
         }
         for (const { key, name, value: assignedValue } of assignments) {
           const field = fields[key];
           if (!field) report(name, `${subject(join(at, key))} isn't ${owner(inner)}`);
-          else value(assignedValue, field.type, join(at, key), field.defaultValue !== undefined);
+          else value(assignedValue, fieldType(field), join(at, key), field.defaultValue !== undefined);
+        }
+        const keys = new Set([...properties.map((property) => property.name), ...assignedKeys]);
+        if (inner.isOneOf && keys.size !== 1) {
+          const optional = properties.some((property) => property.flags & ts.SymbolFlags.Optional);
+          if (optional && keys.size > 1) report(node, `${subject(at)} may set more than one field of ${inner}, so it can't be checked`, true);
+          else report(node, `${subject(at)} must set exactly one field of ${inner}`);
         }
         for (const [key, field] of Object.entries(fields)) {
-          const set = checker.getPropertyOfType(type, key) || assignedKeys.has(key);
-          if (isNonNullType(field.type) && field.defaultValue === undefined && !set) {
-            report(node, `${subject(join(at, key))} is missing, and ${field.type} has no default`);
-          }
+          if (!isNonNullType(field.type) || field.defaultValue !== undefined || checker.getPropertyOfType(type, key)) continue;
+          const setBy = assignments.filter((assignment) => assignment.key === key);
+          if (setBy.some((assignment) => assignment.always)) continue;
+          if (setBy.length > 0) report(setBy[0].name, `${subject(join(at, key))} is only set on some paths, so it can't be checked`, true);
+          else report(node, `${subject(join(at, key))} is missing, and ${field.type} has no default`);
         }
         return;
       }
@@ -338,6 +357,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
 
       if (ts.isIdentifier(expression)) {
         const declaration = symbolOf(expression)?.valueDeclaration;
+        // A helper's parameter holds what the call passes for it
+        if (declaration && passed.has(declaration)) return value(passed.get(declaration), expected, at, omittable);
         if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
           followed.set(declaration, at);
           checkedReferences.add(expression);
@@ -365,7 +386,13 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         const fn = functionOf(checker.getResolvedSignature(expression)?.declaration);
         if (fn && !visiting.has(fn)) {
           visiting.add(fn);
+          const spread = expression.arguments.some(ts.isSpreadElement);
+          fn.parameters.forEach((parameter, index) => {
+            const argument = expression.arguments[index] ?? parameter.initializer;
+            if (!spread && argument && ts.isIdentifier(parameter.name) && !parameter.dotDotDotToken) passed.set(parameter, argument);
+          });
           returns(fn, expected, at, omittable);
+          fn.parameters.forEach((parameter) => passed.delete(parameter));
           visiting.delete(fn);
           return;
         }
@@ -382,6 +409,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     const exported = entrySymbol && checker.getExportsOfModule(entrySymbol).find((symbol) => symbol.name === name);
     const resolved = exported && (exported.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(exported) : exported);
     const fn = functionOf(resolved?.valueDeclaration);
+    if (fn && fn.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+      report(fn, `\`${name}\` is async, so it returns a promise instead of its result`);
+      continue;
+    }
     if (!fn) {
       // The bundler reports a missing export
       if (resolved?.valueDeclaration) {
@@ -414,6 +445,11 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       const object = unwrap(declaration.initializer);
       const assignments = nodes.map(assignmentOf);
       if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean)) {
+        // An assignment in the block the object is created in always runs, unlike one in an `if`, loop or callback
+        const block = declaration.parent.parent.parent;
+        for (const assignment of assignments) {
+          assignment.always = ts.isExpressionStatement(assignment.node.parent) && assignment.node.parent.parent === block;
+        }
         assigned.set(declaration, { object, nodes, assignments });
       } else {
         changed.set(declaration, nodes);
