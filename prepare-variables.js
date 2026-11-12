@@ -6,8 +6,11 @@ const path = require("node:path");
 const ts = require("typescript");
 const {
   GraphQLInputObjectType,
+  GraphQLBoolean,
+  GraphQLFloat,
   GraphQLNonNull,
   GraphQLScalarType,
+  GraphQLString,
   Kind,
   buildSchema,
   getNamedType,
@@ -23,6 +26,20 @@ const {
 
 const unknownScalar = new GraphQLScalarType({ name: "Unknown" });
 
+// The TypeScript type Shopify CLI's codegen config gives each custom scalar, which a function's config can change
+const codegenScalars = {
+  Date: "string",
+  DateTime: "string",
+  DateTimeWithoutTimezone: "string",
+  Decimal: "string",
+  Handle: "string",
+  JSON: "unknown",
+  TimeWithoutTimezone: "string",
+  URL: "string",
+  Void: "null",
+};
+const scalarsByType = { string: GraphQLString, number: GraphQLFloat, boolean: GraphQLBoolean };
+
 /** The prepare targets whose run target has an input query. */
 function preparePairs(targets) {
   return targets.flatMap(({ target, export: name }) => {
@@ -33,9 +50,11 @@ function preparePairs(targets) {
 
 /**
  * Returns `{message, warning}` for each problem, where `message` is `file:line:column message`, relative to `directory`.
- * Values that can't be checked are warnings, and mismatches are errors.
+ * Values that can't be checked are warnings, and mismatches are errors. `scalars` is the function's codegen config.
  */
-function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaPath, targets }) {
+function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaPath, targets, scalars = {} }) {
+  const scalarTypes = { ...codegenScalars };
+  for (const [name, type] of Object.entries(scalars)) scalarTypes[name] = typeof type === "object" ? type?.input : type;
   const pairs = preparePairs(targets);
   if (pairs.length === 0) return [];
   if (!entryPath) {
@@ -101,9 +120,17 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     return ts.createSourceFile(fileName, text.join(""), language);
   };
   const program = ts.createProgram([entry], options, host);
-  // The bundler reports syntax errors better, after this check
+  // A syntax error stops the check. The bundler reports it too, unless the bundle leaves the file out, such as one
+  // only imported with `import type`.
   const local = program.getSourceFiles().filter((file) => !file.isDeclarationFile && !program.isSourceFileFromExternalLibrary(file));
-  if (local.some((file) => program.getSyntacticDiagnostics(file).length > 0)) return [];
+  const syntaxErrors = local.flatMap((file) => program.getSyntacticDiagnostics(file).slice(0, 1));
+  if (syntaxErrors.length > 0) {
+    return syntaxErrors.map(({ file, start, messageText }) => {
+      const { line, character } = file.getLineAndCharacterOfPosition(start);
+      const error = ts.flattenDiagnosticMessageText(messageText, " ");
+      return { message: `${relative(file.fileName)}:${line + 1}:${character + 1} can't be checked because of a syntax error: ${error}`, warning: true };
+    });
+  }
   const checker = program.getTypeChecker();
   const entryFile = program.getSourceFile(entry);
   const entrySymbol = entryFile && checker.getSymbolAtLocation(entryFile);
@@ -118,7 +145,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   };
   const join = (base, key) => (base ? `${base}.${key}` : key);
   const subject = (at) => (at ? `\`${at}\`` : "The result");
-  const unchecked = (type) => Boolean(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown));
+  // A type parameter, such as `T` in a generic helper, can be anything
+  const generic = (type) =>
+    Boolean(type.flags & ts.TypeFlags.InstantiableNonPrimitive) || (type.isIntersection() && type.types.some(generic));
+  const unchecked = (type) => Boolean(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) || generic(type);
 
   const unwrap = (node) => (ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node);
 
@@ -140,6 +170,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   // A reference that could change the value after it's created: assigning to it or a member, deleting or
   // incrementing a member, calling a method on it, or passing, aliasing or reassigning the binding itself.
   // An assignment with a written-out key, `object.key = value` or `object["key"] = value`, to a reference to the object
+  const functionAround = (node) => ts.findAncestor(node.parent, ts.isFunctionLike);
+
   const assignmentOf = (reference) => {
     const access = reference.parent;
     const assignment = access.parent;
@@ -175,7 +207,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     );
   };
 
-  for (const { name, query } of pairs) {
+  for (const { target, name, query } of pairs) {
     const queryPath = path.resolve(directory, query);
     const queryName = relative(queryPath);
     const operation = parse(fs.readFileSync(queryPath, "utf8")).definitions.find(
@@ -191,9 +223,16 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         ]),
       ),
     });
+    // The prepare target's result type, from its mutation field such as `cartValidationsGeneratePrepare(result: …)`, with
+    // `variables` typed as the run query's variables, as the Rust override does. Without one, it only has `variables`.
+    const field = schema.getMutationType()?.getFields()[target.replace(/[.-](\w)/g, (_, letter) => letter.toUpperCase())];
+    const schemaResult = field && getNamedType(field.args.find((argument) => argument.name === "result")?.type);
     const result = new GraphQLInputObjectType({
-      name: "PrepareResult",
-      fields: { variables: { type: new GraphQLNonNull(variables) } },
+      name: isInputObjectType(schemaResult) ? schemaResult.name : "PrepareResult",
+      fields: {
+        ...(isInputObjectType(schemaResult) ? schemaResult.toConfig().fields : {}),
+        variables: { type: new GraphQLNonNull(variables) },
+      },
     });
     const owner = (type) => (type === variables ? `declared by ${queryName}` : `a field of ${type.name}`);
     const followed = new Map();
@@ -202,6 +241,15 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     const changed = new Map();
     const assigned = new Map();
     const passed = new Map();
+    const returning = [];
+    // An assignment after the return being checked doesn't change what it returns, unless a loop around both runs it first
+    const beforeReturn = ({ node }) => {
+      const fn = functionAround(node);
+      const statement = returning.findLast((candidate) => functionAround(candidate) === fn);
+      if (!statement || node.pos < statement.end) return true;
+      const loop = ts.findAncestor(statement, (ancestor) => (ancestor === fn ? "quit" : ts.isIterationStatement(ancestor, false)));
+      return Boolean(loop && node.end <= loop.end);
+    };
 
     // The variable an object literal property is written in, such as `variables` in `const variables = {a: 1}`
     const bindingOf = (property) => {
@@ -241,9 +289,15 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
 
     const typed = (type, expected, at, omittable, node) => {
       const named = getNamedType(expected);
-      // The server decides what a custom scalar, such as JSON or Decimal, accepts
-      if (isScalarType(named) && !isSpecifiedScalarType(named)) return;
-      if (unchecked(type)) return report(node, `${subject(at)} is typed ${checker.typeToString(type)}, so it can't be checked`, true);
+      // A custom scalar is checked as the TypeScript type codegen gives it, so a `Handle` is a string. The server
+      // decides what other ones, such as JSON, accept, but not whether they can be null or a list.
+      const custom = isScalarType(named) && !isSpecifiedScalarType(named);
+      const codegenType = custom ? scalarTypes[named.name] : undefined;
+      const loose = custom && codegenType !== "null" && !scalarsByType[codegenType];
+      if (unchecked(type)) {
+        if (!loose) report(node, `${subject(at)} is typed ${checker.typeToString(type)}, so it can't be checked`, true);
+        return;
+      }
       if (type.isUnion()) return type.types.forEach((member) => typed(member, expected, at, omittable, node));
       if (type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) {
         if (isNonNullType(expected) && !omittable) report(node, `${subject(at)} can be undefined, but ${expected} has no default`);
@@ -283,7 +337,9 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         const fields = inner.getFields();
         // A oneOf input object takes exactly one of its fields, which can't be null
         const fieldType = (field) => (inner.isOneOf ? new GraphQLNonNull(field.type) : field.type);
-        const assignments = [...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? [];
+        const assignments = ([...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? []).filter(
+          beforeReturn,
+        );
         const assignedKeys = new Set(assignments.map((assignment) => assignment.key));
         for (const property of properties) {
           // A property assigned after the object is created is checked with its assignments
@@ -328,7 +384,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         }
         return;
       }
-      const match = isInputObjectType(inner) ? "no" : scalarMatch(type, inner);
+      if (loose) return;
+      const match = isInputObjectType(inner) || codegenType === "null" ? "no" : scalarMatch(type, scalarsByType[codegenType] ?? inner);
       if (match === "no") {
         report(node, `${subject(at)} must be ${expected}, not ${checker.typeToString(type)}`);
       } else if (match === "maybe") {
@@ -342,8 +399,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       if (!ts.isBlock(body)) return value(body, expected, at, omittable);
       const visit = (node) => {
         if (ts.isReturnStatement(node)) {
+          returning.push(node);
           if (node.expression) value(node.expression, expected, at, omittable);
           else typed(checker.getUndefinedType(), expected, at, omittable, node);
+          returning.pop();
         } else if (!ts.isFunctionLike(node)) {
           ts.forEachChild(node, visit);
         }
@@ -384,6 +443,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         return value(expression.right, expected, at, omittable);
       } else if (ts.isCallExpression(expression)) {
         const fn = functionOf(checker.getResolvedSignature(expression)?.declaration);
+        // A generic helper is checked by what its call returns, where its type parameters are known
+        if (fn?.typeParameters) return typed(checker.getTypeAtLocation(expression), expected, at, omittable, expression);
         if (fn && !visiting.has(fn)) {
           visiting.add(fn);
           const spread = expression.arguments.some(ts.isSpreadElement);
@@ -444,7 +505,9 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       if (nodes.length === 0) continue;
       const object = unwrap(declaration.initializer);
       const assignments = nodes.map(assignmentOf);
-      if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean)) {
+      // An assignment in a nested function, such as a callback, may run at any time or not at all
+      const nested = nodes.some((node) => functionAround(node) !== functionAround(declaration));
+      if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean) && !nested) {
         // An assignment in the block the object is created in always runs, unlike one in an `if`, loop or callback
         const block = declaration.parent.parent.parent;
         for (const assignment of assignments) {

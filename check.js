@@ -7,6 +7,7 @@
 // the JavaScript function the CLI bundles. It exits non-zero, failing the build, when a prepare target returns
 // variables its run query doesn't accept, and warns about variables it can't check.
 const fs = require("node:fs");
+const path = require("node:path");
 const { parseArgs } = require("node:util");
 const { prepareVariablesProblems } = require("./prepare-variables.js");
 
@@ -17,7 +18,7 @@ try {
   const name = fn.handle ? `The function extension "${fn.handle}"` : "The function";
   let problems;
   try {
-    problems = prepareVariablesProblems(fn);
+    problems = prepareVariablesProblems({ ...fn, scalars: codegenScalars(fn.directory) });
   } catch (error) {
     // A problem in the check itself shouldn't stop the build
     console.warn(`${name}'s prepare variables couldn't be checked: ${error.message}`);
@@ -36,4 +37,13 @@ try {
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;
+}
+
+// The scalars in the function's codegen config, which Shopify CLI merges with its own
+function codegenScalars(directory) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(directory, "package.json"), "utf8")).codegen?.config?.scalars ?? {};
+  } catch {
+    return {};
+  }
 }

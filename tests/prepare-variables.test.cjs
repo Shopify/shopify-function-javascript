@@ -8,13 +8,17 @@ const { prepareVariablesProblems } = require("../prepare-variables.js");
 const schema = `
   scalar JSON
   scalar Decimal
+  scalar Handle
+  scalar Void
   enum Mode { FAST SLOW }
   input Selector @oneOf { id: ID, handle: String }
   input Rule { handle: String!, weight: Int }
   type Query { shop: String, id: ID }
+  input CartValidationsGeneratePrepareResult { variables: JSON!, cacheKey: String }
+  type Mutation { cartValidationsGeneratePrepare(result: CartValidationsGeneratePrepareResult!): Void! }
 `;
 const runQuery =
-  "query Run($handle: String!, $limit: Int = 5, $mode: Mode, $rules: [Rule!], $data: JSON, $id: ID, $price: Decimal, $selector: Selector) { shop }";
+  "query Run($handle: String!, $limit: Int = 5, $mode: Mode, $rules: [Rule!], $data: JSON, $id: ID, $price: Decimal, $selector: Selector, $handles: [Handle!], $nothing: Void) { shop }";
 
 const paired = [
   { target: "cart.validations.generate.prepare", export: "cartValidationsGeneratePrepare" },
@@ -22,14 +26,14 @@ const paired = [
 ];
 
 // Writes a function with `files` in src/ and returns its problems, without their locations. Warnings start with "warning: ".
-function check(files, targets = paired) {
+function check(files, targets = paired, scalars) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prepare-"));
   try {
     fs.mkdirSync(path.join(directory, "src"));
     fs.writeFileSync(path.join(directory, "schema.graphql"), schema);
     fs.writeFileSync(path.join(directory, "src/run.graphql"), runQuery);
     for (const [file, content] of Object.entries(files)) fs.writeFileSync(path.join(directory, "src", file), content);
-    return prepareVariablesProblems({ directory, entry: "src/index.js", schema: "schema.graphql", targets }).map(
+    return prepareVariablesProblems({ directory, entry: "src/index.js", schema: "schema.graphql", targets, scalars }).map(
       ({ message, warning }) => `${warning ? "warning: " : ""}${message.replace(/^\S+:\d+:\d+ /, "")}`,
     );
   } finally {
@@ -183,6 +187,17 @@ describe("prepareVariablesProblems", () => {
     );
   });
 
+  test("checks a generic helper by what its call returns", () => {
+    const generic = (variables) =>
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": `function first<T>(...xs: T[]): T { return xs[0]! }\nexport function cartValidationsGeneratePrepare<T>(input: {t: T}) { return {variables: ${variables}} }`,
+      });
+    assert.deepEqual(generic(`{handle: first(...['a'])}`), []);
+    assert.deepEqual(generic(`{handle: 'a', limit: first('x')}`), ["`variables.limit` must be Int, not \"x\""]);
+    assert.deepEqual(generic(`{handle: input.t}`), ["warning: `variables.handle` is typed T, so it can't be checked"]);
+  });
+
   test("follows the arguments a helper is called with", () => {
     assert.deepEqual(
       check({
@@ -202,13 +217,24 @@ describe("prepareVariablesProblems", () => {
     );
   });
 
+  test("only checks assignments that can change what's returned", () => {
+    const built = (lines) => check(prepare(`const variables = {handle: 'a'}\n${lines}`));
+    assert.deepEqual(built(`const later = () => { variables.limit = 'x' }\nreturn {variables}`), [
+      "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+    ]);
+    assert.deepEqual(built(`if (input.a) return {variables}\nvariables.limit = 'x'\nreturn {variables: {handle: 'b'}}`), []);
+    assert.deepEqual(built(`const result = {variables}\nvariables.limit = 'x'\nreturn result`), ["`variables.limit` must be Int, not \"x\""]);
+    assert.deepEqual(built(`for (const x of input.list) { if (x) return {variables}; variables.limit = 'x' }\nreturn {variables: {handle: 'b'}}`), [
+      "`variables.limit` must be Int, not \"x\"",
+    ]);
+  });
+
   test("warns about a required variable that's only set on some paths", () => {
     const assigned = (lines) => check(prepare(`const variables = {}\n${lines}\nreturn {variables}`));
     assert.deepEqual(assigned(`variables.handle = 'a'`), []);
     for (const lines of [
       `if (input.a) variables.handle = 'a'`,
       `for (const x of input.list) variables.handle = 'a'`,
-      `input.list.forEach(() => { variables.handle = 'a' })`,
     ]) {
       assert.deepEqual(assigned(lines), ["warning: `variables.handle` is only set on some paths, so it can't be checked"], lines);
     }
@@ -259,6 +285,33 @@ describe("prepareVariablesProblems", () => {
     );
   });
 
+  test("checks the prepare result's other fields from the schema", () => {
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKey: 'k'}`)), []);
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKey: 5}`)), ["`cacheKey` must be String, not 5"]);
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKy: 'k'}`)), [
+      "`cacheKy` isn't a field of CartValidationsGeneratePrepareResult",
+    ]);
+  });
+
+  test("checks custom scalars as the type codegen gives them", () => {
+    const vars = (value, scalars) => check(prepare(`return {variables: {handle: 'a', ${value}}}`), undefined, scalars);
+    assert.deepEqual(vars(`handles: ['h']`), []);
+    assert.deepEqual(vars(`handles: [5]`), ["`variables.handles[]` must be Handle!, not 5"]);
+    assert.deepEqual(vars(`price: '1.5'`), []);
+    assert.deepEqual(vars(`price: 1.5`), ["`variables.price` must be Decimal, not 1.5"]);
+    assert.deepEqual(vars(`price: 1.5`, { Decimal: "number" }), []);
+    assert.deepEqual(vars(`price: 1.5`, { Decimal: { input: "unknown", output: "string" } }), []);
+    assert.deepEqual(vars(`data: {a: [1]}`), []);
+    assert.deepEqual(vars(`nothing: null`), []);
+    assert.deepEqual(vars(`nothing: 'x'`), ["`variables.nothing` must be Void, not \"x\""]);
+  });
+
+  test("checks null and lists for custom scalars", () => {
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a', handles: ['h', null]}}`)), [
+      "`variables.handles[]` can be null, but Handle! can't",
+    ]);
+  });
+
   test("trusts non-null assertions", () => {
     assert.deepEqual(
       check({
@@ -304,7 +357,7 @@ describe("prepareVariablesProblems", () => {
           const MODES = ['FAST', 'SLOW']
           /** @param {{a: boolean, m: string}} input */
           export function cartValidationsGeneratePrepare(input) {
-            return {variables: {handle: (input.a && 'x') || 'y', id: 5, mode: input.a ? input.m : MODES[0], price: 1.5}}
+            return {variables: {handle: (input.a && 'x') || 'y', id: 5, mode: input.a ? input.m : MODES[0], price: '1.5'}}
           }`,
       }),
       [
@@ -320,7 +373,7 @@ describe("prepareVariablesProblems", () => {
     ]);
   });
 
-  test("warns about an export it can't follow, and leaves missing exports and syntax errors to the bundler", () => {
+  test("warns about an export it can't follow, and leaves missing exports to the bundler", () => {
     assert.deepEqual(
       check({
         "index.js": `
@@ -338,7 +391,20 @@ describe("prepareVariablesProblems", () => {
       ["warning: `cartValidationsGeneratePrepare` isn't a function it can follow, so it can't be checked"],
     );
     assert.deepEqual(check({ "index.js": "export function other() {}" }), []);
+  });
+
+  test("warns about a syntax error, even in a file the bundle leaves out", () => {
     // A function missing its closing brace
-    assert.deepEqual(check({ "index.js": "export function cartValidationsGeneratePrepare() {\n  return {variables: {handle: 1}}" }), []);
+    assert.deepEqual(check({ "index.js": "export function cartValidationsGeneratePrepare() {\n  return {variables: {handle: 1}}" }), [
+      "warning: can't be checked because of a syntax error: '}' expected.",
+    ]);
+    assert.deepEqual(
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": "import type { X } from './types.ts'\nexport function cartValidationsGeneratePrepare() { return {variables: {handle: 1}} }",
+        "types.ts": "export type X = { a: ; }",
+      }),
+      ["warning: can't be checked because of a syntax error: Type expected."],
+    );
   });
 });

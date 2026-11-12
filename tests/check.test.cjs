@@ -9,6 +9,7 @@ const check = path.join(__dirname, "..", "check.js");
 
 const schema = `
 scalar JSON
+scalar Decimal
 input LineSelector @oneOf { id: ID, handle: String }
 type CartLine { id: ID! }
 type Query { id: ID!, lines(selector: LineSelector!, first: Int): [CartLine!]! }
@@ -20,12 +21,13 @@ const targets = [
 ];
 
 // Runs check.js for a function whose prepare target returns `variables`, as Shopify CLI does.
-function runCheck(t, { variables = "{}", fn = {} } = {}) {
+function runCheck(t, { variables = "{}", fn = {}, packageJson } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "function-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.mkdirSync(path.join(dir, "src"));
   fs.writeFileSync(path.join(dir, "schema.graphql"), schema);
-  fs.writeFileSync(path.join(dir, "src/run.graphql"), "query Run($selector: LineSelector!, $first: Int) { lines(selector: $selector, first: $first) { id } }");
+  fs.writeFileSync(path.join(dir, "src/run.graphql"), "query Run($selector: LineSelector!, $first: Int, $price: Decimal) { lines(selector: $selector, first: $first) { id } }");
+  if (packageJson) fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(packageJson));
   fs.writeFileSync(path.join(dir, "src/index.js"), `export function targetPrepare() {\n  return { variables: ${variables} };\n}\n`);
   const json = path.join(dir, "function.json");
   fs.writeFileSync(json, JSON.stringify({ handle: "prepare-test", directory: dir, entry: "src/index.js", schema: "schema.graphql", targets, ...fn }));
@@ -64,6 +66,13 @@ test("warns, without failing, about variables it can't check", (t) => {
       "",
     ].join("\n"),
   );
+});
+
+test("checks custom scalars with the function's codegen config", (t) => {
+  const variables = '{ selector: { id: "1" }, price: 1.5 }';
+  assert.match(runCheck(t, { variables }).stderr, /`variables.price` must be Decimal, not 1.5/);
+  const packageJson = { codegen: { config: { scalars: { Decimal: "number" } } } };
+  assert.equal(runCheck(t, { variables, packageJson }).status, 0);
 });
 
 test("warns, without failing, when the check itself fails", (t) => {
