@@ -38,7 +38,13 @@ const codegenScalars = {
   URL: "string",
   Void: "null",
 };
-const scalarsByType = { string: GraphQLString, number: GraphQLFloat, boolean: GraphQLBoolean };
+// The built-in scalar each of those TypeScript types is checked as. `null` is for Void, which only takes null.
+const scalarsByType = {
+  string: GraphQLString,
+  number: GraphQLFloat,
+  boolean: GraphQLBoolean,
+  null: new GraphQLScalarType({ name: "Null", parseValue: () => undefined }),
+};
 
 /** The prepare targets whose run target has an input query. */
 function preparePairs(targets) {
@@ -50,13 +56,18 @@ function preparePairs(targets) {
 
 /**
  * Returns `{message, warning}` for each problem, where `message` is `file:line:column message`, relative to `directory`.
- * Values that can't be checked are warnings, and mismatches are errors. `scalars` is the function's codegen config.
+ * Values that can't be checked are warnings, and mismatches are errors.
  */
-function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaPath, targets, scalars = {} }) {
-  const scalarTypes = { ...codegenScalars };
-  for (const [name, type] of Object.entries(scalars)) scalarTypes[name] = typeof type === "object" ? type?.input : type;
+function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaPath, targets }) {
   const pairs = preparePairs(targets);
   if (pairs.length === 0) return [];
+  // Shopify CLI merges the codegen config in the function's package.json with its own
+  const packageJson = path.join(directory, "package.json");
+  const { codegen } = fs.existsSync(packageJson) ? JSON.parse(fs.readFileSync(packageJson, "utf8")) : {};
+  const scalarTypes = { ...codegenScalars };
+  for (const [name, type] of Object.entries(codegen?.config?.scalars ?? {})) {
+    scalarTypes[name] = typeof type === "object" ? type?.input : type;
+  }
   if (!entryPath) {
     return [{ message: "The function has no entry file, such as src/index.js, to check its prepare targets in", warning: false }];
   }
@@ -120,10 +131,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     return ts.createSourceFile(fileName, text.join(""), language);
   };
   const program = ts.createProgram([entry], options, host);
+  const isLocal = (file) => !file.isDeclarationFile && !program.isSourceFileFromExternalLibrary(file);
   // A syntax error stops the check. The bundler reports it too, unless the bundle leaves the file out, such as one
   // only imported with `import type`.
-  const local = program.getSourceFiles().filter((file) => !file.isDeclarationFile && !program.isSourceFileFromExternalLibrary(file));
-  const syntaxErrors = local.flatMap((file) => program.getSyntacticDiagnostics(file).slice(0, 1));
+  const syntaxErrors = program.getSourceFiles().filter(isLocal).flatMap((file) => program.getSyntacticDiagnostics(file).slice(0, 1));
   if (syntaxErrors.length > 0) {
     return syntaxErrors.map(({ file, start, messageText }) => {
       const { line, character } = file.getLineAndCharacterOfPosition(start);
@@ -155,9 +166,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   const functionOf = (node) => {
     if (!node) return;
     if (ts.isVariableDeclaration(node)) return node.initializer && functionOf(unwrap(node.initializer));
-    const local =
-      !node.getSourceFile().isDeclarationFile && !program.isSourceFileFromExternalLibrary(node.getSourceFile());
-    if (local && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node))) {
+    if (isLocal(node.getSourceFile()) && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node))) {
       return node.body && node;
     }
   };
@@ -167,11 +176,9 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       ? checker.getShorthandAssignmentValueSymbol(node.parent)
       : checker.getSymbolAtLocation(node);
 
-  // A reference that could change the value after it's created: assigning to it or a member, deleting or
-  // incrementing a member, calling a method on it, or passing, aliasing or reassigning the binding itself.
-  // An assignment with a written-out key, `object.key = value` or `object["key"] = value`, to a reference to the object
   const functionAround = (node) => ts.findAncestor(node.parent, ts.isFunctionLike);
 
+  // An assignment with a written-out key, `object.key = value` or `object["key"] = value`, to a reference to the object
   const assignmentOf = (reference) => {
     const access = reference.parent;
     const assignment = access.parent;
@@ -183,6 +190,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     return key === undefined ? undefined : { key, name, value: assignment.right, node: assignment };
   };
 
+  // A reference that could change the value after it's created: assigning to it or a member, deleting or
+  // incrementing a member, calling a method on it, or passing, aliasing or reassigning the binding itself.
   const changes = (reference) => {
     let top = reference;
     while (
@@ -235,7 +244,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       },
     });
     const owner = (type) => (type === variables ? `declared by ${queryName}` : `a field of ${type.name}`);
-    const followed = new Map();
+    const followed = new Set();
     const checkedReferences = new Set();
     const visiting = new Set();
     const changed = new Map();
@@ -261,11 +270,11 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     };
     // A variable changed or passed on after it's created may not hold what it was created with, so it's not checked
     // An object assigned to by name is checked with its assignments, but only where it's created
-    const skipChanged = (declaration, at, node) => {
+    const skipChanged = (declaration, at, object) => {
       const assignments = assigned.get(declaration);
-      const changes = changed.get(declaration) ?? (assignments && assignments.object !== node ? assignments.nodes : undefined);
-      for (const node of changes ?? []) {
-        report(node, `${subject(at)} is changed or passed on after it's created, so it can't be checked`, true);
+      const changes = changed.get(declaration) ?? (assignments && assignments.object !== object ? assignments.nodes : undefined);
+      for (const change of changes ?? []) {
+        report(change, `${subject(at)} is changed or passed on after it's created, so it can't be checked`, true);
       }
       return Boolean(changes);
     };
@@ -289,13 +298,11 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
 
     const typed = (type, expected, at, omittable, node) => {
       const named = getNamedType(expected);
-      // A custom scalar is checked as the TypeScript type codegen gives it, so a `Handle` is a string. The server
+      // A custom scalar is checked as the TypeScript type codegen gives it, so a `Handle` is a String. The server
       // decides what other ones, such as JSON, accept, but not whether they can be null or a list.
-      const custom = isScalarType(named) && !isSpecifiedScalarType(named);
-      const codegenType = custom ? scalarTypes[named.name] : undefined;
-      const loose = custom && codegenType !== "null" && !scalarsByType[codegenType];
+      const checkedAs = isScalarType(named) && !isSpecifiedScalarType(named) ? scalarsByType[scalarTypes[named.name]] : named;
       if (unchecked(type)) {
-        if (!loose) report(node, `${subject(at)} is typed ${checker.typeToString(type)}, so it can't be checked`, true);
+        if (checkedAs) report(node, `${subject(at)} is typed ${checker.typeToString(type)}, so it can't be checked`, true);
         return;
       }
       if (type.isUnion()) return type.types.forEach((member) => typed(member, expected, at, omittable, node));
@@ -307,6 +314,11 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         if (isNonNullType(expected)) report(node, `${subject(at)} can be null, but ${expected} can't`);
         return;
       }
+      // A value with a toJSON method, such as a Date, is written out as what it returns, as JSON.stringify does
+      const toJSON = checker.getPropertyOfType(type, "toJSON");
+      const [write] = toJSON ? checker.getSignaturesOfType(checker.getTypeOfSymbol(toJSON), ts.SignatureKind.Call) : [];
+      const written = write && checker.getReturnTypeOfSignature(write);
+      if (written && written !== type) return typed(written, expected, at, omittable, node);
       const inner = isNonNullType(expected) ? expected.ofType : expected;
       if (isListType(inner)) {
         const element =
@@ -325,7 +337,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
           const expression = unwrap(spread.expression);
           const declaration = ts.isIdentifier(expression) && symbolOf(expression)?.valueDeclaration;
           if (declaration && ts.isVariableDeclaration(declaration)) {
-            followed.set(declaration, at);
+            followed.add(declaration);
             bindings.add(declaration);
           }
           const spreadType = checker.getTypeAtLocation(spread.expression);
@@ -357,7 +369,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
             report(assignment ?? node, `${subject(key)} isn't ${owner(inner)}`);
           } else if (assignment) {
             const binding = bindingOf(property);
-            if (binding) followed.set(binding, at);
+            if (binding) followed.add(binding);
             const initializer = ts.isPropertyAssignment(assignment) ? assignment.initializer : assignment.name;
             value(initializer, fieldType(field), key, field.defaultValue !== undefined);
           } else {
@@ -384,8 +396,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         }
         return;
       }
-      if (loose) return;
-      const match = isInputObjectType(inner) || codegenType === "null" ? "no" : scalarMatch(type, scalarsByType[codegenType] ?? inner);
+      if (!checkedAs) return;
+      const match = isInputObjectType(checkedAs) ? "no" : scalarMatch(type, checkedAs);
       if (match === "no") {
         report(node, `${subject(at)} must be ${expected}, not ${checker.typeToString(type)}`);
       } else if (match === "maybe") {
@@ -419,7 +431,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         // A helper's parameter holds what the call passes for it
         if (declaration && passed.has(declaration)) return value(passed.get(declaration), expected, at, omittable);
         if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
-          followed.set(declaration, at);
+          followed.add(declaration);
           checkedReferences.add(expression);
           if (skipChanged(declaration, at, unwrap(declaration.initializer))) return;
           return value(declaration.initializer, expected, at, omittable);
@@ -486,7 +498,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     muted = true;
     returns(fn, new GraphQLNonNull(result), "", false);
     muted = false;
-    for (const declaration of followed.keys()) {
+    for (const declaration of followed) {
       const symbol = checker.getSymbolAtLocation(declaration.name);
       const nodes = [];
       const visit = (node) => {
@@ -508,7 +520,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       // An assignment in a nested function, such as a callback, may run at any time or not at all
       const nested = nodes.some((node) => functionAround(node) !== functionAround(declaration));
       if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean) && !nested) {
-        // An assignment in the block the object is created in always runs, unlike one in an `if`, loop or callback
+        // An assignment in the block the object is created in always runs, unlike one in an `if` or a loop
         const block = declaration.parent.parent.parent;
         for (const assignment of assignments) {
           assignment.always = ts.isExpressionStatement(assignment.node.parent) && assignment.node.parent.parent === block;

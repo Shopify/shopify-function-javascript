@@ -26,14 +26,14 @@ const paired = [
 ];
 
 // Writes a function with `files` in src/ and returns its problems, without their locations. Warnings start with "warning: ".
-function check(files, targets = paired, scalars) {
+function check(files, targets = paired) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prepare-"));
   try {
     fs.mkdirSync(path.join(directory, "src"));
     fs.writeFileSync(path.join(directory, "schema.graphql"), schema);
     fs.writeFileSync(path.join(directory, "src/run.graphql"), runQuery);
     for (const [file, content] of Object.entries(files)) fs.writeFileSync(path.join(directory, "src", file), content);
-    return prepareVariablesProblems({ directory, entry: "src/index.js", schema: "schema.graphql", targets, scalars }).map(
+    return prepareVariablesProblems({ directory, entry: "src/index.js", schema: "schema.graphql", targets }).map(
       ({ message, warning }) => `${warning ? "warning: " : ""}${message.replace(/^\S+:\d+:\d+ /, "")}`,
     );
   } finally {
@@ -104,6 +104,97 @@ describe("prepareVariablesProblems", () => {
     assert.deepEqual(check(prepare(`return {}`)), ["`variables` is missing, and Variables! has no default"]);
   });
 
+  test("only fails on values that are definitely wrong", () => {
+    assert.deepEqual(
+      check({
+        "index.js": `
+          const MODES = ['FAST', 'SLOW']
+          /** @param {{a: boolean, m: string}} input */
+          export function cartValidationsGeneratePrepare(input) {
+            return {variables: {handle: (input.a && 'x') || 'y', id: 5, mode: input.a ? input.m : MODES[0], price: '1.5'}}
+          }`,
+      }),
+      [
+        // One for `input.m`, and one for `MODES[0]`
+        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
+        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
+      ],
+    );
+    assert.deepEqual(check(prepare(`return {variables: {handle: (input.a && false) || true, id: 1.5}}`)), [
+      "warning: `variables.handle` is typed any, so it can't be checked",
+      "`variables.handle` must be String!, not true",
+      "`variables.id` must be ID, not 1.5",
+    ]);
+  });
+
+  test("checks the prepare result's other fields from the schema", () => {
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKey: 'k'}`)), []);
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKey: 5}`)), ["`cacheKey` must be String, not 5"]);
+    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKy: 'k'}`)), [
+      "`cacheKy` isn't a field of CartValidationsGeneratePrepareResult",
+    ]);
+  });
+
+  test("rejects an async prepare target", () => {
+    assert.deepEqual(check({ "index.js": "export async function cartValidationsGeneratePrepare() { return {variables: {handle: 'a'}} }" }), [
+      "`cartValidationsGeneratePrepare` is async, so it returns a promise instead of its result",
+    ]);
+  });
+
+  test("checks custom scalars as the type codegen gives them", () => {
+    const vars = (value, scalars) =>
+      check({
+        ...prepare(`return {variables: {handle: 'a', ${value}}}`),
+        "../package.json": JSON.stringify({ codegen: { config: { scalars } } }),
+      });
+    assert.deepEqual(vars(`handles: ['h']`), []);
+    assert.deepEqual(vars(`handles: ['h', null]`), ["`variables.handles[]` can be null, but Handle! can't"]);
+    assert.deepEqual(vars(`handles: [5]`), ["`variables.handles[]` must be Handle!, not 5"]);
+    assert.deepEqual(vars(`price: '1.5'`), []);
+    assert.deepEqual(vars(`price: 1.5`), ["`variables.price` must be Decimal, not 1.5"]);
+    assert.deepEqual(vars(`price: 1.5`, { Decimal: "number" }), []);
+    assert.deepEqual(vars(`price: 1.5`, { Decimal: { input: "unknown", output: "string" } }), []);
+    assert.deepEqual(vars(`price: 1.5`, null), ["`variables.price` must be Decimal, not 1.5"]);
+    assert.deepEqual(vars(`data: {a: [1]}`), []);
+    assert.deepEqual(vars(`nothing: null`), []);
+    assert.deepEqual(vars(`nothing: 'x'`), ["`variables.nothing` must be Void, not \"x\""]);
+  });
+
+  test("checks a value with toJSON as what it returns", () => {
+    const vars = (value) => check(prepare(`return {variables: {handle: ${value}}}`));
+    assert.deepEqual(vars(`new Date()`), []);
+    assert.deepEqual(vars(`{toJSON: () => 'a'}`), []);
+    assert.deepEqual(vars(`{toJSON: () => 5}`), ["`variables.handle` must be String!, not number"]);
+  });
+
+  test("applies oneOf input object rules", () => {
+    const selector = (value) => check(prepare(`return {variables: {handle: 'a', selector: ${value}}}`));
+    assert.deepEqual(selector(`{id: '1'}`), []);
+    assert.deepEqual(selector(`{id: '1', handle: 'x'}`), ["`variables.selector` must set exactly one field of Selector"]);
+    assert.deepEqual(selector(`{}`), ["`variables.selector` must set exactly one field of Selector"]);
+    assert.deepEqual(selector(`{id: null}`), ["`variables.selector.id` can be null, but ID! can't"]);
+  });
+
+  test("treats an array element as possibly undefined", () => {
+    assert.deepEqual(
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": "export function cartValidationsGeneratePrepare(input: {list: string[]}) { return {variables: {handle: input.list[0]}} }",
+      }),
+      ["`variables.handle` can be undefined, but String! has no default"],
+    );
+  });
+
+  test("trusts non-null assertions", () => {
+    assert.deepEqual(
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": "export function cartValidationsGeneratePrepare(input: {list: string[]}) { return {variables: {handle: input.list.find((x) => x)!}} }",
+      }),
+      [],
+    );
+  });
+
   test("checks what is built, not what the return type declares", () => {
     assert.deepEqual(
       check({
@@ -115,48 +206,6 @@ describe("prepareVariablesProblems", () => {
           }`,
       }),
       ["`variables.region` isn't declared by src/run.graphql"],
-    );
-  });
-
-  test("sees through casts, @ts-ignore and helpers", () => {
-    assert.deepEqual(
-      check({
-        "index.js": `
-          export function cartValidationsGeneratePrepare(input) {
-            // @ts-ignore
-            if (input.a) return {variables: /** @type {{handle: string}} */ (JSON.parse(input.raw))}
-            return {variables: build()}
-          }
-          function build() {
-            return {handle: 2}
-          }`,
-      }),
-      ["warning: `variables` is typed any, so it can't be checked", "`variables.handle` must be String!, not 2"],
-    );
-  });
-
-  test("warns about, rather than checks, variables changed or passed on after they are created", () => {
-    assert.deepEqual(
-      check(
-        prepare(`
-          const variables = {handle: 'a'}
-          variables.limit = 'many'
-          tweak(variables)
-          return {variables}`),
-      ),
-      [
-        "warning: `variables` is changed or passed on after it's created, so it can't be checked",
-        "warning: `variables` is changed or passed on after it's created, so it can't be checked",
-      ],
-    );
-    assert.deepEqual(
-      check(
-        prepare(`
-          const base = {handle: 'a'}
-          base.handle = 1
-          return {variables: {...base}}`),
-      ),
-      ["warning: `variables` is changed or passed on after it's created, so it can't be checked"],
     );
   });
 
@@ -187,80 +236,20 @@ describe("prepareVariablesProblems", () => {
     );
   });
 
-  test("checks a generic helper by what its call returns", () => {
-    const generic = (variables) =>
-      check({
-        "index.js": "export * from './prepare.ts'",
-        "prepare.ts": `function first<T>(...xs: T[]): T { return xs[0]! }\nexport function cartValidationsGeneratePrepare<T>(input: {t: T}) { return {variables: ${variables}} }`,
-      });
-    assert.deepEqual(generic(`{handle: first(...['a'])}`), []);
-    assert.deepEqual(generic(`{handle: 'a', limit: first('x')}`), ["`variables.limit` must be Int, not \"x\""]);
-    assert.deepEqual(generic(`{handle: input.t}`), ["warning: `variables.handle` is typed T, so it can't be checked"]);
-  });
-
-  test("follows the arguments a helper is called with", () => {
+  test("sees through casts, @ts-ignore and helpers", () => {
     assert.deepEqual(
       check({
-        "index.js": `/** @param {{n: number}} input */
-          export function cartValidationsGeneratePrepare(input) { return {variables: build(input.n)} }
-          /** @param {string} handle */
-          function build(handle) { return {handle} }`,
+        "index.js": `
+          export function cartValidationsGeneratePrepare(input) {
+            // @ts-ignore
+            if (input.a) return {variables: /** @type {{handle: string}} */ (JSON.parse(input.raw))}
+            return {variables: build()}
+          }
+          function build() {
+            return {handle: 2}
+          }`,
       }),
-      ["`variables.handle` must be String!, not number"],
-    );
-    assert.deepEqual(
-      check({
-        "index.js": "export * from './prepare.ts'",
-        "prepare.ts": "function id<T>(x: T): T { return x }\nexport function cartValidationsGeneratePrepare() { return {variables: id({handle: 'a'})} }",
-      }),
-      [],
-    );
-  });
-
-  test("only checks assignments that can change what's returned", () => {
-    const built = (lines) => check(prepare(`const variables = {handle: 'a'}\n${lines}`));
-    assert.deepEqual(built(`const later = () => { variables.limit = 'x' }\nreturn {variables}`), [
-      "warning: `variables` is changed or passed on after it's created, so it can't be checked",
-    ]);
-    assert.deepEqual(built(`if (input.a) return {variables}\nvariables.limit = 'x'\nreturn {variables: {handle: 'b'}}`), []);
-    assert.deepEqual(built(`const result = {variables}\nvariables.limit = 'x'\nreturn result`), ["`variables.limit` must be Int, not \"x\""]);
-    assert.deepEqual(built(`for (const x of input.list) { if (x) return {variables}; variables.limit = 'x' }\nreturn {variables: {handle: 'b'}}`), [
-      "`variables.limit` must be Int, not \"x\"",
-    ]);
-  });
-
-  test("warns about a required variable that's only set on some paths", () => {
-    const assigned = (lines) => check(prepare(`const variables = {}\n${lines}\nreturn {variables}`));
-    assert.deepEqual(assigned(`variables.handle = 'a'`), []);
-    for (const lines of [
-      `if (input.a) variables.handle = 'a'`,
-      `for (const x of input.list) variables.handle = 'a'`,
-    ]) {
-      assert.deepEqual(assigned(lines), ["warning: `variables.handle` is only set on some paths, so it can't be checked"], lines);
-    }
-  });
-
-  test("applies oneOf input object rules", () => {
-    const selector = (value) => check(prepare(`return {variables: {handle: 'a', selector: ${value}}}`));
-    assert.deepEqual(selector(`{id: '1'}`), []);
-    assert.deepEqual(selector(`{id: '1', handle: 'x'}`), ["`variables.selector` must set exactly one field of Selector"]);
-    assert.deepEqual(selector(`{}`), ["`variables.selector` must set exactly one field of Selector"]);
-    assert.deepEqual(selector(`{id: null}`), ["`variables.selector.id` can be null, but ID! can't"]);
-  });
-
-  test("rejects an async prepare target", () => {
-    assert.deepEqual(check({ "index.js": "export async function cartValidationsGeneratePrepare() { return {variables: {handle: 'a'}} }" }), [
-      "`cartValidationsGeneratePrepare` is async, so it returns a promise instead of its result",
-    ]);
-  });
-
-  test("warns about spreading an object that can have any keys", () => {
-    assert.deepEqual(
-      check({
-        "index.js": `/** @param {{json: Record<string, unknown>}} input */
-          export function cartValidationsGeneratePrepare(input) { return {variables: {handle: 'a', ...input.json}} }`,
-      }),
-      ["warning: `variables` spreads an object that can have any keys, so it can't be checked"],
+      ["warning: `variables` is typed any, so it can't be checked", "`variables.handle` must be String!, not 2"],
     );
   });
 
@@ -275,60 +264,38 @@ describe("prepareVariablesProblems", () => {
     ]);
   });
 
-  test("treats an array element as possibly undefined", () => {
+  test("warns about spreading an object that can have any keys", () => {
     assert.deepEqual(
       check({
-        "index.js": "export * from './prepare.ts'",
-        "prepare.ts": "export function cartValidationsGeneratePrepare(input: {list: string[]}) { return {variables: {handle: input.list[0]}} }",
+        "index.js": `/** @param {{json: Record<string, unknown>}} input */
+          export function cartValidationsGeneratePrepare(input) { return {variables: {handle: 'a', ...input.json}} }`,
       }),
-      ["`variables.handle` can be undefined, but String! has no default"],
+      ["warning: `variables` spreads an object that can have any keys, so it can't be checked"],
     );
   });
 
-  test("checks the prepare result's other fields from the schema", () => {
-    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKey: 'k'}`)), []);
-    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKey: 5}`)), ["`cacheKey` must be String, not 5"]);
-    assert.deepEqual(check(prepare(`return {variables: {handle: 'a'}, cacheKy: 'k'}`)), [
-      "`cacheKy` isn't a field of CartValidationsGeneratePrepareResult",
-    ]);
-  });
-
-  test("checks custom scalars as the type codegen gives them", () => {
-    const vars = (value, scalars) => check(prepare(`return {variables: {handle: 'a', ${value}}}`), undefined, scalars);
-    assert.deepEqual(vars(`handles: ['h']`), []);
-    assert.deepEqual(vars(`handles: [5]`), ["`variables.handles[]` must be Handle!, not 5"]);
-    assert.deepEqual(vars(`price: '1.5'`), []);
-    assert.deepEqual(vars(`price: 1.5`), ["`variables.price` must be Decimal, not 1.5"]);
-    assert.deepEqual(vars(`price: 1.5`, { Decimal: "number" }), []);
-    assert.deepEqual(vars(`price: 1.5`, { Decimal: { input: "unknown", output: "string" } }), []);
-    assert.deepEqual(vars(`data: {a: [1]}`), []);
-    assert.deepEqual(vars(`nothing: null`), []);
-    assert.deepEqual(vars(`nothing: 'x'`), ["`variables.nothing` must be Void, not \"x\""]);
-  });
-
-  test("checks null and lists for custom scalars", () => {
-    assert.deepEqual(check(prepare(`return {variables: {handle: 'a', handles: ['h', null]}}`)), [
-      "`variables.handles[]` can be null, but Handle! can't",
-    ]);
-  });
-
-  test("trusts non-null assertions", () => {
+  test("warns about, rather than checks, variables changed or passed on after they are created", () => {
     assert.deepEqual(
-      check({
-        "index.js": "export * from './prepare.ts'",
-        "prepare.ts": "export function cartValidationsGeneratePrepare(input: {list: string[]}) { return {variables: {handle: input.list.find((x) => x)!}} }",
-      }),
-      [],
+      check(
+        prepare(`
+          const variables = {handle: 'a'}
+          variables.limit = 'many'
+          tweak(variables)
+          return {variables}`),
+      ),
+      [
+        "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+        "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+      ],
     );
-  });
-
-  test("follows re-exports", () => {
     assert.deepEqual(
-      check({
-        "index.js": `export * from './prepare.js'`,
-        "prepare.js": `export const cartValidationsGeneratePrepare = () => ({variables: {handle: 1}})`,
-      }),
-      ["`variables.handle` must be String!, not 1"],
+      check(
+        prepare(`
+          const base = {handle: 'a'}
+          base.handle = 1
+          return {variables: {...base}}`),
+      ),
+      ["warning: `variables` is changed or passed on after it's created, so it can't be checked"],
     );
   });
 
@@ -350,27 +317,67 @@ describe("prepareVariablesProblems", () => {
     ]);
   });
 
-  test("only fails on values that are definitely wrong", () => {
+  test("warns about a required variable that's only set on some paths", () => {
+    const assigned = (lines) => check(prepare(`const variables = {}\n${lines}\nreturn {variables}`));
+    assert.deepEqual(assigned(`variables.handle = 'a'`), []);
+    for (const lines of [
+      `if (input.a) variables.handle = 'a'`,
+      `for (const x of input.list) variables.handle = 'a'`,
+    ]) {
+      assert.deepEqual(assigned(lines), ["warning: `variables.handle` is only set on some paths, so it can't be checked"], lines);
+    }
+  });
+
+  test("only checks assignments that can change what's returned", () => {
+    const built = (lines) => check(prepare(`const variables = {handle: 'a'}\n${lines}`));
+    assert.deepEqual(built(`const later = () => { variables.limit = 'x' }\nreturn {variables}`), [
+      "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+    ]);
+    assert.deepEqual(built(`if (input.a) return {variables}\nvariables.limit = 'x'\nreturn {variables: {handle: 'b'}}`), []);
+    assert.deepEqual(built(`const result = {variables}\nvariables.limit = 'x'\nreturn result`), ["`variables.limit` must be Int, not \"x\""]);
+    assert.deepEqual(built(`for (const x of input.list) { if (x) return {variables}; variables.limit = 'x' }\nreturn {variables: {handle: 'b'}}`), [
+      "`variables.limit` must be Int, not \"x\"",
+    ]);
+  });
+
+  test("follows the arguments a helper is called with", () => {
     assert.deepEqual(
       check({
-        "index.js": `
-          const MODES = ['FAST', 'SLOW']
-          /** @param {{a: boolean, m: string}} input */
-          export function cartValidationsGeneratePrepare(input) {
-            return {variables: {handle: (input.a && 'x') || 'y', id: 5, mode: input.a ? input.m : MODES[0], price: '1.5'}}
-          }`,
+        "index.js": `/** @param {{n: number}} input */
+          export function cartValidationsGeneratePrepare(input) { return {variables: build(input.n)} }
+          /** @param {string} handle */
+          function build(handle) { return {handle} }`,
       }),
-      [
-        // One for `input.m`, and one for `MODES[0]`
-        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
-        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
-      ],
+      ["`variables.handle` must be String!, not number"],
     );
-    assert.deepEqual(check(prepare(`return {variables: {handle: (input.a && false) || true, id: 1.5}}`)), [
-      "warning: `variables.handle` is typed any, so it can't be checked",
-      "`variables.handle` must be String!, not true",
-      "`variables.id` must be ID, not 1.5",
-    ]);
+    assert.deepEqual(
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": "function id<T>(x: T): T { return x }\nexport function cartValidationsGeneratePrepare() { return {variables: id({handle: 'a'})} }",
+      }),
+      [],
+    );
+  });
+
+  test("checks a generic helper by what its call returns", () => {
+    const generic = (variables) =>
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": `function first<T>(...xs: T[]): T { return xs[0]! }\nexport function cartValidationsGeneratePrepare<T>(input: {t: T}) { return {variables: ${variables}} }`,
+      });
+    assert.deepEqual(generic(`{handle: first(...['a'])}`), []);
+    assert.deepEqual(generic(`{handle: 'a', limit: first('x')}`), ["`variables.limit` must be Int, not \"x\""]);
+    assert.deepEqual(generic(`{handle: input.t}`), ["warning: `variables.handle` is typed T, so it can't be checked"]);
+  });
+
+  test("follows re-exports", () => {
+    assert.deepEqual(
+      check({
+        "index.js": `export * from './prepare.js'`,
+        "prepare.js": `export const cartValidationsGeneratePrepare = () => ({variables: {handle: 1}})`,
+      }),
+      ["`variables.handle` must be String!, not 1"],
+    );
   });
 
   test("warns about an export it can't follow, and leaves missing exports to the bundler", () => {
