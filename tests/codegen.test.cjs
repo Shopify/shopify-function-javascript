@@ -95,7 +95,8 @@ test("generated types have no type errors when a query uses enums and input obje
     fs.mkdirSync(path.join(dir, "src"));
     fs.writeFileSync(path.join(dir, "src", "run.graphql"), inputQuery);
     // Codegen resolves its plugins from the function directory, as in an installed function.
-    fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "dir");
+    // A junction on Windows, which needs no extra privileges; the type is ignored elsewhere.
+    fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "junction");
 
     const configPath = path.join(configDir, "codegen.json");
     fs.writeFileSync(
@@ -105,7 +106,13 @@ test("generated types have no type errors when a query uses enums and input obje
         config: { ...cliDefaults, ...templateCodegen.config, scalars: cliDefaults.scalars },
       }),
     );
-    const bin = fs.realpathSync(path.join(root, "node_modules", ".bin", "graphql-code-generator"));
+    // Resolve the bin script from the package itself: on Windows, node_modules/.bin
+    // holds shell and cmd shims rather than symlinks to the JavaScript entry point.
+    const cliPackageJson = require.resolve("@graphql-codegen/cli/package.json");
+    const bin = path.join(
+      path.dirname(cliPackageJson),
+      require(cliPackageJson).bin["graphql-code-generator"],
+    );
     execFileSync(process.execPath, [bin, "--config", configPath], { cwd: dir, stdio: "pipe" });
 
     const program = ts.createProgram([path.join(dir, "generated", "api.ts")], {
