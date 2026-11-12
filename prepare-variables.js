@@ -7,6 +7,7 @@ const ts = require("typescript");
 const {
   GraphQLInputObjectType,
   GraphQLNonNull,
+  GraphQLScalarType,
   Kind,
   buildSchema,
   getNamedType,
@@ -14,28 +15,13 @@ const {
   isInputObjectType,
   isListType,
   isNonNullType,
+  isScalarType,
+  isSpecifiedScalarType,
   parse,
   typeFromAST,
 } = require("graphql");
 
-// How each scalar's values appear in the variables, as Shopify CLI's codegen config types them. Other custom scalars,
-// like `JSON`, accept anything.
-const scalarKinds = {
-  Int: "number",
-  Float: "number",
-  String: "string",
-  Boolean: "boolean",
-  ID: "string",
-  Handle: "string",
-  Decimal: "string",
-  Date: "string",
-  DateTime: "string",
-  DateTimeWithoutTimezone: "string",
-  TimeWithoutTimezone: "string",
-  URL: "string",
-  Void: "null",
-};
-const scalarKind = (named) => scalarKinds[named.name] ?? "unknown";
+const unknownScalar = new GraphQLScalarType({ name: "Unknown" });
 
 /** The prepare targets whose run target has an input query. */
 function preparePairs(targets) {
@@ -111,6 +97,9 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     return ts.createSourceFile(fileName, text.join(""), language);
   };
   const program = ts.createProgram([entry], options, host);
+  // The bundler reports syntax errors better, after this check
+  const local = program.getSourceFiles().filter((file) => !file.isDeclarationFile && !program.isSourceFileFromExternalLibrary(file));
+  if (local.some((file) => program.getSyntacticDiagnostics(file).length > 0)) return [];
   const checker = program.getTypeChecker();
   const entryFile = program.getSourceFile(entry);
   const entrySymbol = entryFile && checker.getSymbolAtLocation(entryFile);
@@ -146,6 +135,18 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
 
   // A reference that could change the value after it's created: assigning to it or a member, deleting or
   // incrementing a member, calling a method on it, or passing, aliasing or reassigning the binding itself.
+  // An assignment with a written-out key, `object.key = value` or `object["key"] = value`, to a reference to the object
+  const assignmentOf = (reference) => {
+    const access = reference.parent;
+    const assignment = access.parent;
+    const direct = (ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access)) && access.expression === reference;
+    if (!direct || !ts.isBinaryExpression(assignment) || assignment.left !== access) return;
+    if (assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return;
+    const name = ts.isPropertyAccessExpression(access) ? access.name : access.argumentExpression;
+    const key = ts.isIdentifier(name) || ts.isStringLiteralLike(name) ? name.text : undefined;
+    return key === undefined ? undefined : { key, name, value: assignment.right };
+  };
+
   const changes = (reference) => {
     let top = reference;
     while (
@@ -181,7 +182,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       fields: Object.fromEntries(
         (operation?.variableDefinitions ?? []).map((definition) => [
           definition.variable.name.value,
-          { type: typeFromAST(schema, definition.type), defaultValue: definition.defaultValue },
+          // A type the schema doesn't have is left to codegen, which reports it
+          { type: typeFromAST(schema, definition.type) ?? unknownScalar, defaultValue: definition.defaultValue },
         ]),
       ),
     });
@@ -194,6 +196,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     const checkedReferences = new Set();
     const visiting = new Set();
     const changed = new Map();
+    const assigned = new Map();
 
     // The variable an object literal property is written in, such as `variables` in `const variables = {a: 1}`
     const bindingOf = (property) => {
@@ -204,34 +207,37 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       return binding && ts.isVariableDeclaration(binding) && ts.isIdentifier(binding.name) ? binding : undefined;
     };
     // A variable changed or passed on after it's created may not hold what it was created with, so it's not checked
-    const skipChanged = (declaration, at) => {
-      const changes = changed.get(declaration);
+    // An object assigned to by name is checked with its assignments, but only where it's created
+    const skipChanged = (declaration, at, node) => {
+      const assignments = assigned.get(declaration);
+      const changes = changed.get(declaration) ?? (assignments && assignments.object !== node ? assignments.nodes : undefined);
       for (const node of changes ?? []) {
         report(node, `${subject(at)} is changed or passed on after it's created, so it can't be checked`, true);
       }
       return Boolean(changes);
     };
 
-    const scalarMatches = (type, named) => {
-      if (isEnumType(named)) return type.isStringLiteral() && named.getValue(type.value) !== undefined;
-      switch (scalarKind(named)) {
-        case "string":
-          return Boolean(type.flags & ts.TypeFlags.StringLike);
-        case "number":
-          return (
-            Boolean(type.flags & ts.TypeFlags.NumberLike) &&
-            !(named.name === "Int" && type.isNumberLiteral() && !Number.isInteger(type.value))
-          );
-        case "boolean":
-          return Boolean(type.flags & ts.TypeFlags.BooleanLike);
-        default:
+    // Whether a built-in scalar or an enum accepts a value, by GraphQL's own coercion: "yes", "no", or "maybe" when it
+    // depends on which of its type's values it is. A type like `number` is tried with one of its values.
+    const scalarMatch = (type, named) => {
+      const accepts = (value) => {
+        try {
+          return named.parseValue(value) !== undefined;
+        } catch {
           return false;
-      }
+        }
+      };
+      if (type.isStringLiteral() || type.isNumberLiteral()) return accepts(type.value) ? "yes" : "no";
+      if (type.flags & ts.TypeFlags.BooleanLiteral) return accepts(type === checker.getTrueType()) ? "yes" : "no";
+      if (type.flags & ts.TypeFlags.StringLike) return isEnumType(named) ? "maybe" : accepts("") ? "yes" : "no";
+      if (type.flags & ts.TypeFlags.NumberLike) return accepts(0) ? "yes" : "no";
+      return "no";
     };
 
     const typed = (type, expected, at, omittable, node) => {
       const named = getNamedType(expected);
-      if (!isEnumType(named) && !isInputObjectType(named) && scalarKind(named) === "unknown") return;
+      // The server decides what a custom scalar, such as JSON or Decimal, accepts
+      if (isScalarType(named) && !isSpecifiedScalarType(named)) return;
       if (unchecked(type)) return report(node, `${subject(at)} is typed ${checker.typeToString(type)}, so it can't be checked`, true);
       if (type.isUnion()) return type.types.forEach((member) => typed(member, expected, at, omittable, node));
       if (type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) {
@@ -254,9 +260,22 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         }
         const properties = checker.getPropertiesOfType(type);
         const bindings = new Set(properties.map(bindingOf).filter(Boolean));
-        if ([...bindings].map((binding) => skipChanged(binding, at)).some(Boolean)) return;
+        // A spread object adds what it holds when it's spread, which may not be what it was created with
+        for (const spread of ts.isObjectLiteralExpression(node) ? node.properties.filter(ts.isSpreadAssignment) : []) {
+          const expression = unwrap(spread.expression);
+          const declaration = ts.isIdentifier(expression) && symbolOf(expression)?.valueDeclaration;
+          if (declaration && ts.isVariableDeclaration(declaration)) {
+            followed.set(declaration, at);
+            bindings.add(declaration);
+          }
+        }
+        if ([...bindings].map((binding) => skipChanged(binding, at, node)).some(Boolean)) return;
         const fields = inner.getFields();
+        const assignments = [...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? [];
+        const assignedKeys = new Set(assignments.map((assignment) => assignment.key));
         for (const property of properties) {
+          // A property assigned after the object is created is checked with its assignments
+          if (assignedKeys.has(property.name)) continue;
           const field = fields[property.name];
           const key = join(at, property.name);
           // A property written in an object literal is followed to its value, keeping literal types (like an enum
@@ -277,15 +296,24 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
             typed(checker.getTypeOfSymbol(property), field.type, key, field.defaultValue !== undefined, node);
           }
         }
+        for (const { key, name, value: assignedValue } of assignments) {
+          const field = fields[key];
+          if (!field) report(name, `${subject(join(at, key))} isn't ${owner(inner)}`);
+          else value(assignedValue, field.type, join(at, key), field.defaultValue !== undefined);
+        }
         for (const [key, field] of Object.entries(fields)) {
-          if (isNonNullType(field.type) && field.defaultValue === undefined && !checker.getPropertyOfType(type, key)) {
+          const set = checker.getPropertyOfType(type, key) || assignedKeys.has(key);
+          if (isNonNullType(field.type) && field.defaultValue === undefined && !set) {
             report(node, `${subject(join(at, key))} is missing, and ${field.type} has no default`);
           }
         }
         return;
       }
-      if (isInputObjectType(inner) || !scalarMatches(type, inner)) {
+      const match = isInputObjectType(inner) ? "no" : scalarMatch(type, inner);
+      if (match === "no") {
         report(node, `${subject(at)} must be ${expected}, not ${checker.typeToString(type)}`);
+      } else if (match === "maybe") {
+        report(node, `${subject(at)} is ${checker.typeToString(type)}, which ${inner} may not accept, so it can't be checked`, true);
       }
     };
 
@@ -313,7 +341,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
           followed.set(declaration, at);
           checkedReferences.add(expression);
-          if (skipChanged(declaration, at)) return;
+          if (skipChanged(declaration, at, unwrap(declaration.initializer))) return;
           return value(declaration.initializer, expected, at, omittable);
         }
       } else if (ts.isConditionalExpression(expression)) {
@@ -324,8 +352,14 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         (expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
           expression.operatorToken.kind === ts.SyntaxKind.BarBarToken)
       ) {
-        const left = checker.getNonNullableType(checker.getTypeAtLocation(expression.left));
-        typed(left, expected, at, omittable, expression.left);
+        // `??` uses the left side unless it's null or undefined, and `||` only when it's truthy
+        const or = expression.operatorToken.kind === ts.SyntaxKind.BarBarToken;
+        const left = checker.getTypeAtLocation(expression.left);
+        for (const member of left.isUnion() ? left.types : [left]) {
+          if (member.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)) continue;
+          if (or && (member === checker.getFalseType() || ((member.isStringLiteral() || member.isNumberLiteral()) && !member.value))) continue;
+          typed(member, expected, at, omittable, expression.left);
+        }
         return value(expression.right, expected, at, omittable);
       } else if (ts.isCallExpression(expression)) {
         const fn = functionOf(checker.getResolvedSignature(expression)?.declaration);
@@ -349,7 +383,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     const resolved = exported && (exported.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(exported) : exported);
     const fn = functionOf(resolved?.valueDeclaration);
     if (!fn) {
-      problems.set(`${path.relative(directory, entry)} has no \`${name}\` function to check`, false);
+      // The bundler reports a missing export
+      if (resolved?.valueDeclaration) {
+        report(resolved.valueDeclaration, `\`${name}\` isn't a function it can follow, so it can't be checked`, true);
+      }
       continue;
     }
     // The first pass finds the variables the result is built from, and the second checks it, skipping the ones
@@ -373,9 +410,17 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         ts.forEachChild(node, visit);
       };
       visit(declaration.getSourceFile());
-      if (nodes.length > 0) changed.set(declaration, nodes);
+      if (nodes.length === 0) continue;
+      const object = unwrap(declaration.initializer);
+      const assignments = nodes.map(assignmentOf);
+      if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean)) {
+        assigned.set(declaration, { object, nodes, assignments });
+      } else {
+        changed.set(declaration, nodes);
+      }
     }
     visiting.clear();
+    followed.clear();
     returns(fn, new GraphQLNonNull(result), "", false);
   }
 

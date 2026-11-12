@@ -7,11 +7,13 @@ const { prepareVariablesProblems } = require("../prepare-variables.js");
 
 const schema = `
   scalar JSON
+  scalar Decimal
   enum Mode { FAST SLOW }
   input Rule { handle: String!, weight: Int }
-  type Query { shop: String }
+  type Query { shop: String, id: ID }
 `;
-const runQuery = "query Run($handle: String!, $limit: Int = 5, $mode: Mode, $rules: [Rule!], $data: JSON) { shop }";
+const runQuery =
+  "query Run($handle: String!, $limit: Int = 5, $mode: Mode, $rules: [Rule!], $data: JSON, $id: ID, $price: Decimal) { shop }";
 
 const paired = [
   { target: "cart.validations.generate.prepare", export: "cartValidationsGeneratePrepare" },
@@ -151,16 +153,6 @@ describe("prepareVariablesProblems", () => {
       ),
       ["warning: `variables` is changed or passed on after it's created, so it can't be checked"],
     );
-    // A variable set after the object is created isn't reported missing
-    assert.deepEqual(
-      check(
-        prepare(`
-          const variables = {}
-          variables.handle = 'a'
-          return {variables}`),
-      ),
-      ["warning: `variables` is changed or passed on after it's created, so it can't be checked"],
-    );
   });
 
   test("ignores what annotations and casts claim", () => {
@@ -185,7 +177,7 @@ describe("prepareVariablesProblems", () => {
       }),
       [
         "`variables.handle` can be undefined, but String! has no default",
-        "`variables.mode` must be Mode, not string",
+        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
         "warning: `variables` is typed any, so it can't be checked",
       ],
     );
@@ -201,9 +193,66 @@ describe("prepareVariablesProblems", () => {
     );
   });
 
-  test("rejects a missing prepare export", () => {
-    assert.deepEqual(check({ "index.js": "export function other() {}" }), [
-      "src/index.js has no `cartValidationsGeneratePrepare` function to check",
+  test("checks variables assigned by name after the object is created", () => {
+    const assigned = (lines) => check(prepare(`const variables = ${lines}\nreturn {variables}`));
+    assert.deepEqual(assigned(`{}\nvariables.handle = 'a'\nvariables['limit'] = 5`), []);
+    assert.deepEqual(assigned(`{handle: null}\nvariables.handle = 'a'`), []);
+    assert.deepEqual(assigned(`{handle: 'a'}\nif (input.a) variables.region = 'eu'`), [
+      "`variables.region` isn't declared by src/run.graphql",
     ]);
+    assert.deepEqual(assigned(`{handle: 'a'}\nvariables.limit = 'many'`), ['`variables.limit` must be Int, not "many"']);
+    assert.deepEqual(assigned(`{}\nvariables.limit = 5`), ["`variables.handle` is missing, and String! has no default"]);
+    // Keys that aren't written out, and objects spread after they're assigned to, still can't be checked
+    assert.deepEqual(assigned(`{handle: 'a'}\nvariables[input.key] = 5`), [
+      "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+    ]);
+    assert.deepEqual(check(prepare(`const base = {}\nbase.handle = 'a'\nreturn {variables: {...base}}`)), [
+      "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+    ]);
+  });
+
+  test("only fails on values that are definitely wrong", () => {
+    assert.deepEqual(
+      check({
+        "index.js": `
+          const MODES = ['FAST', 'SLOW']
+          /** @param {{a: boolean, m: string}} input */
+          export function cartValidationsGeneratePrepare(input) {
+            return {variables: {handle: (input.a && 'x') || 'y', id: 5, mode: input.a ? input.m : MODES[0], price: 1.5}}
+          }`,
+      }),
+      [
+        // One for `input.m`, and one for `MODES[0]`
+        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
+        "warning: `variables.mode` is string, which Mode may not accept, so it can't be checked",
+      ],
+    );
+    assert.deepEqual(check(prepare(`return {variables: {handle: (input.a && false) || true, id: 1.5}}`)), [
+      "warning: `variables.handle` is typed any, so it can't be checked",
+      "`variables.handle` must be String!, not true",
+      "`variables.id` must be ID, not 1.5",
+    ]);
+  });
+
+  test("warns about an export it can't follow, and leaves missing exports and syntax errors to the bundler", () => {
+    assert.deepEqual(
+      check({
+        "index.js": `
+          const wrap = (fn) => fn
+          export const cartValidationsGeneratePrepare = wrap(() => ({variables: {handle: 'a'}}))`,
+      }),
+      ["warning: `cartValidationsGeneratePrepare` isn't a function it can follow, so it can't be checked"],
+    );
+    assert.deepEqual(
+      check({
+        "index.js": `
+          const handlers = {cartValidationsGeneratePrepare() { return {variables: {handle: 'a'}} }}
+          export const cartValidationsGeneratePrepare = handlers.cartValidationsGeneratePrepare`,
+      }),
+      ["warning: `cartValidationsGeneratePrepare` isn't a function it can follow, so it can't be checked"],
+    );
+    assert.deepEqual(check({ "index.js": "export function other() {}" }), []);
+    // A function missing its closing brace
+    assert.deepEqual(check({ "index.js": "export function cartValidationsGeneratePrepare() {\n  return {variables: {handle: 1}}" }), []);
   });
 });

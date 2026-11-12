@@ -14,8 +14,15 @@ try {
   const { values } = parseArgs({ options: { function: { type: "string" } } });
   if (!values.function) throw new Error("Usage: check.js --function <function JSON>");
   const fn = { schema: "schema.graphql", targets: [], ...JSON.parse(fs.readFileSync(values.function, "utf8")) };
-  const problems = prepareVariablesProblems(fn);
   const name = fn.handle ? `The function extension "${fn.handle}"` : "The function";
+  let problems;
+  try {
+    problems = prepareVariablesProblems(fn);
+  } catch (error) {
+    // A problem in the check itself shouldn't stop the build
+    console.warn(`${name}'s prepare variables couldn't be checked: ${error.message}`);
+    problems = [];
+  }
   const list = (warning) => problems.filter((problem) => problem.warning === warning).map((problem) => problem.message);
 
   const warnings = list(true);

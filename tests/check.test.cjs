@@ -66,6 +66,12 @@ test("warns, without failing, about variables it can't check", (t) => {
   );
 });
 
+test("warns, without failing, when the check itself fails", (t) => {
+  const result = runCheck(t, { fn: { schema: "missing.graphql" } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /The function extension "prepare-test"'s prepare variables couldn't be checked: ENOENT/);
+});
+
 test("passes a function without prepare targets", (t) => {
   const result = runCheck(t, { fn: { entry: undefined, targets: [targets[1]] } });
   assert.equal(result.status, 0, result.stderr);
