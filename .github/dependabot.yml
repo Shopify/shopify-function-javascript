@@ -6,5 +6,10 @@ updates:
       interval: weekly
     open-pull-requests-limit: 100
     registries: "*"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
     reviewers:
       - "@Shopify/functions-dependabot-reviewers"
