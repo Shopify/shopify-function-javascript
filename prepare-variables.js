@@ -61,6 +61,9 @@ function preparePairs(targets) {
 function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaPath, targets }) {
   const pairs = preparePairs(targets);
   if (pairs.length === 0) return [];
+  if (!entryPath) {
+    return [{ message: "The function has no entry file, such as src/index.js, to check its prepare targets in", warning: false }];
+  }
   // Shopify CLI merges the codegen config in the function's package.json with its own
   const packageJson = path.join(directory, "package.json");
   const { codegen } = fs.existsSync(packageJson) ? JSON.parse(fs.readFileSync(packageJson, "utf8")) : {};
@@ -68,12 +71,13 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   for (const [name, type] of Object.entries(codegen?.config?.scalars ?? {})) {
     scalarTypes[name] = typeof type === "object" ? type?.input : type;
   }
-  if (!entryPath) {
-    return [{ message: "The function has no entry file, such as src/index.js, to check its prepare targets in", warning: false }];
-  }
   const entry = path.resolve(directory, entryPath);
   // Paths in messages use forward slashes, as Shopify CLI's do, on Windows too
   const relative = (file) => path.relative(directory, file).split(path.sep).join("/");
+  const locate = (file, position) => {
+    const { line, character } = file.getLineAndCharacterOfPosition(position);
+    return `${relative(file.fileName)}:${line + 1}:${character + 1}`;
+  };
 
   const schema = buildSchema(fs.readFileSync(path.resolve(directory, schemaPath), "utf8"));
   const options = {
@@ -138,9 +142,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   const syntaxErrors = program.getSourceFiles().filter(isLocal).flatMap((file) => program.getSyntacticDiagnostics(file).slice(0, 1));
   if (syntaxErrors.length > 0) {
     return syntaxErrors.map(({ file, start, messageText }) => {
-      const { line, character } = file.getLineAndCharacterOfPosition(start);
       const error = ts.flattenDiagnosticMessageText(messageText, " ");
-      return { message: `${relative(file.fileName)}:${line + 1}:${character + 1} can't be checked because of a syntax error: ${error}`, warning: true };
+      return { message: `${locate(file, start)} can't be checked because of a syntax error: ${error}`, warning: true };
     });
   }
   const checker = program.getTypeChecker();
@@ -150,10 +153,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   let muted = false;
 
   const report = (node, message, warning = false) => {
-    if (muted) return;
-    const file = node.getSourceFile();
-    const { line, character } = file.getLineAndCharacterOfPosition(node.getStart());
-    problems.set(`${relative(file.fileName)}:${line + 1}:${character + 1} ${message}`, warning);
+    if (!muted) problems.set(`${locate(node.getSourceFile(), node.getStart())} ${message}`, warning);
   };
   const join = (base, key) => (base ? `${base}.${key}` : key);
   const subject = (at) => (at ? `\`${at}\`` : "The result");
@@ -292,8 +292,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       const binding = assignment && declaration.parent.parent;
       return binding && ts.isVariableDeclaration(binding) && ts.isIdentifier(binding.name) ? binding : undefined;
     };
-    // A variable changed or passed on after it's created may not hold what it was created with, so it's not checked
-    // An object assigned to by name is checked with its assignments, but only where it's created
+    // A variable changed or passed on after it's created may not hold what it was created with, so it's not checked,
+    // except an object assigned to by name, which is checked with its assignments where it's created
     const skipChanged = (declaration, at, object) => {
       const assignments = assigned.get(declaration);
       const changes = changed.get(declaration) ?? (assignments && assignments.object !== object ? assignments.nodes : undefined);
@@ -332,7 +332,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       // No value has the type never, such as an element of `[].slice()`
       if (type.flags & ts.TypeFlags.Never) return;
       if (type.isUnion()) return type.types.forEach((member) => typed(member, expected, at, omittable, node));
-      if (type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) {
+      if (isUndefined(type)) {
         if (isNonNullType(expected) && !omittable) report(node, `${subject(at)} can be undefined, but ${expected} has no default`);
         return;
       }
@@ -343,8 +343,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       // A value with a toJSON method, such as a Date, is written out as what it returns, as JSON.stringify does
       const toJSON = checker.getPropertyOfType(type, "toJSON");
       const [write] = toJSON ? checker.getSignaturesOfType(checker.getTypeOfSymbol(toJSON), ts.SignatureKind.Call) : [];
-      const written = write && checker.getReturnTypeOfSignature(write);
-      if (written && written !== type) return typed(written, expected, at, omittable, node);
+      const json = write && checker.getReturnTypeOfSignature(write);
+      if (json && json !== type) return typed(json, expected, at, omittable, node);
       const inner = isNonNullType(expected) ? expected.ofType : expected;
       if (isListType(inner)) {
         const element =
@@ -377,12 +377,12 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         // undefined, which JSON leaves out.
         const fieldType = (field) => (inner.isOneOf ? new GraphQLNonNull(field.type) : field.type);
         const canOmit = (field) => inner.isOneOf || field.defaultValue !== undefined;
-        const written = ([...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? []).filter(
+        const reaching = ([...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? []).filter(
           reachesReturn,
         );
         // A write that a later one to the same key always replaces isn't returned, and neither is a property one replaces
-        const assignments = written.filter(
-          (assignment, index) => !written.slice(index + 1).some((later) => later.key === assignment.key && later.always),
+        const assignments = reaching.filter(
+          (assignment, index) => !reaching.slice(index + 1).some((later) => later.key === assignment.key && later.always),
         );
         const replaced = new Set(assignments.filter((assignment) => assignment.always).map((assignment) => assignment.key));
         for (const property of properties) {
