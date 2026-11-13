@@ -110,7 +110,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) {
         blank(node.expression.end, node.end);
       } else if (ts.isTypeAssertionExpression(node)) {
-        blank(node.type.pos - 1, node.expression.pos);
+        // Unless a line break follows it, where blanking it would end a `return <T>` before what it returns
+        if (!/[\r\n]/.test(file.text.slice(node.expression.pos, node.expression.getStart()))) blank(node.type.pos - 1, node.expression.pos);
       } else if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && node.typeArguments) {
         blank(node.typeArguments.pos - 1, node.typeArguments.end + 1);
       } else if (
@@ -163,7 +164,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   const members = (type) => (type.isUnion() ? type.types : [type]);
   const isUndefined = (type) => Boolean(type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void));
 
-  const unwrap = (node) => (ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node);
+  const unwrap = (node) =>
+    ts.isParenthesizedExpression(node) || ts.isTypeAssertionExpression(node) ? unwrap(node.expression) : node;
 
   const functionOf = (node) => {
     if (!node) return;
@@ -208,16 +210,26 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     if (top === reference) {
       return !(ts.isSpreadAssignment(parent) || ts.isSpreadElement(parent) || ts.isTypeOfExpression(parent));
     }
+    return written(top) || ts.isDeleteExpression(parent) || (ts.isCallExpression(parent) && parent.expression === top);
+  };
+
+  // Whether `node` is given a new value, as in `node = …`, `node += …` or `node++`
+  const written = (node) => {
+    const { parent } = node;
     return (
       (ts.isBinaryExpression(parent) &&
-        parent.left === top &&
+        parent.left === node &&
         parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
         parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
-      ts.isDeleteExpression(parent) ||
       ((ts.isPrefixUnaryExpression(parent) || ts.isPostfixUnaryExpression(parent)) &&
-        (parent.operator === ts.SyntaxKind.PlusPlusToken || parent.operator === ts.SyntaxKind.MinusMinusToken)) ||
-      (ts.isCallExpression(parent) && parent.expression === top)
+        (parent.operator === ts.SyntaxKind.PlusPlusToken || parent.operator === ts.SyntaxKind.MinusMinusToken))
     );
+  };
+  // Whether a helper gives its parameter a new value
+  const reassigned = (parameter) => {
+    const symbol = checker.getSymbolAtLocation(parameter.name);
+    const visit = (node) => (ts.isIdentifier(node) && symbolOf(node) === symbol && written(node)) || ts.forEachChild(node, visit);
+    return Boolean(visit(parameter.parent));
   };
 
   for (const { target, name, query } of pairs) {
@@ -255,11 +267,19 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     const assigned = new Map();
     const passed = new Map();
     const returning = [];
-    // An assignment after the return being checked doesn't change what it returns, unless a loop around both runs it first
-    const beforeReturn = ({ node }) => {
+    // An assignment can't change what the return being checked returns if a return or throw follows it in a block
+    // the return isn't in, as in `if (…) { x.a = 1; return … }`, or if it comes after the return, unless a loop around
+    // both runs it first
+    const reachesReturn = ({ node }) => {
       const fn = functionAround(node);
       const statement = returning.findLast((candidate) => functionAround(candidate) === fn);
-      if (!statement || node.pos < statement.end) return true;
+      if (!statement) return true;
+      for (let child = node; !(child.parent.pos <= statement.pos && statement.end <= child.parent.end); child = child.parent) {
+        const statements = ts.isBlock(child.parent) || ts.isCaseOrDefaultClause(child.parent) ? child.parent.statements : [];
+        const later = statements.includes(child) ? statements.slice(statements.indexOf(child) + 1) : [];
+        if (later.some((exit) => ts.isReturnStatement(exit) || ts.isThrowStatement(exit))) return false;
+      }
+      if (node.pos < statement.end) return true;
       const loop = ts.findAncestor(statement, (ancestor) => (ancestor === fn ? "quit" : ts.isIterationStatement(ancestor, false)));
       return Boolean(loop && node.end <= loop.end);
     };
@@ -358,7 +378,7 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         const fieldType = (field) => (inner.isOneOf ? new GraphQLNonNull(field.type) : field.type);
         const canOmit = (field) => inner.isOneOf || field.defaultValue !== undefined;
         const written = ([...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? []).filter(
-          beforeReturn,
+          reachesReturn,
         );
         // A write that a later one to the same key always replaces isn't returned, and neither is a property one replaces
         const assignments = written.filter(
@@ -462,8 +482,11 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       if (ts.isIdentifier(expression)) {
         const symbol = symbolOf(expression);
         const declaration = symbol?.valueDeclaration;
-        // A helper's parameter holds what the call passes for it, or its default where that's undefined
-        if (declaration && passed.has(declaration)) {
+        // A use a check narrows, such as `x` in `typeof x === "string" ? x : …`, is checked as its narrowed type
+        const narrowed = symbol && checker.getTypeAtLocation(expression) !== checker.getTypeOfSymbol(symbol);
+        // A helper's parameter holds what the call passes for it, or its default where that's undefined, unless the
+        // helper narrows it or gives it a new value
+        if (declaration && passed.has(declaration) && !narrowed && !reassigned(declaration)) {
           const { argument, initializer } = passed.get(declaration);
           if (!argument) return value(initializer, expected, at, omittable);
           if (!initializer || !members(checker.getTypeAtLocation(argument)).some(isUndefined)) {
@@ -471,8 +494,6 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
           }
           return orElse(argument, initializer, isUndefined, expected, at, omittable);
         }
-        // A use a check narrows, such as `x` in `typeof x === "string" ? x : …`, is checked as its narrowed type
-        const narrowed = symbol && checker.getTypeAtLocation(expression) !== checker.getTypeOfSymbol(symbol);
         if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer && !narrowed) {
           followed.add(declaration);
           checkedReferences.add(expression);
@@ -535,45 +556,50 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       }
       continue;
     }
-    // The first pass finds the variables the result is built from, and the second checks it, skipping the ones
-    // changed after they're created
+    // Muted passes find the variables the result is built from and what changes them, until a pass finds nothing new,
+    // such as a variable only reached through an assignment's value. The last pass checks the result, skipping the
+    // variables changed after they're created.
     muted = true;
-    returns(fn, new GraphQLNonNull(result), "", false);
-    muted = false;
-    for (const declaration of followed) {
-      const symbol = checker.getSymbolAtLocation(declaration.name);
-      const nodes = [];
-      const visit = (node) => {
-        if (
-          ts.isIdentifier(node) &&
-          node !== declaration.name &&
-          !checkedReferences.has(node) &&
-          symbolOf(node) === symbol &&
-          changes(node)
-        ) {
-          nodes.push(node);
+    for (let found = -1; found < followed.size + checkedReferences.size; ) {
+      found = followed.size + checkedReferences.size;
+      returns(fn, new GraphQLNonNull(result), "", false);
+      changed.clear();
+      assigned.clear();
+      for (const declaration of followed) {
+        const symbol = checker.getSymbolAtLocation(declaration.name);
+        const nodes = [];
+        const visit = (node) => {
+          if (
+            ts.isIdentifier(node) &&
+            node !== declaration.name &&
+            !checkedReferences.has(node) &&
+            symbolOf(node) === symbol &&
+            changes(node)
+          ) {
+            nodes.push(node);
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(declaration.getSourceFile());
+        if (nodes.length === 0) continue;
+        const object = unwrap(declaration.initializer);
+        const assignments = nodes.map(assignmentOf);
+        // An assignment in a nested function, such as a callback, may run at any time or not at all
+        const nested = nodes.some((node) => functionAround(node) !== functionAround(declaration));
+        if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean) && !nested) {
+          // An assignment in the block the object is created in always runs, unlike one in an `if` or a loop
+          const block = declaration.parent.parent.parent;
+          for (const assignment of assignments) {
+            assignment.always = ts.isExpressionStatement(assignment.node.parent) && assignment.node.parent.parent === block;
+          }
+          assigned.set(declaration, { object, nodes, assignments });
+        } else {
+          changed.set(declaration, nodes);
         }
-        ts.forEachChild(node, visit);
-      };
-      visit(declaration.getSourceFile());
-      if (nodes.length === 0) continue;
-      const object = unwrap(declaration.initializer);
-      const assignments = nodes.map(assignmentOf);
-      // An assignment in a nested function, such as a callback, may run at any time or not at all
-      const nested = nodes.some((node) => functionAround(node) !== functionAround(declaration));
-      if (ts.isObjectLiteralExpression(object) && assignments.every(Boolean) && !nested) {
-        // An assignment in the block the object is created in always runs, unlike one in an `if` or a loop
-        const block = declaration.parent.parent.parent;
-        for (const assignment of assignments) {
-          assignment.always = ts.isExpressionStatement(assignment.node.parent) && assignment.node.parent.parent === block;
-        }
-        assigned.set(declaration, { object, nodes, assignments });
-      } else {
-        changed.set(declaration, nodes);
       }
     }
+    muted = false;
     visiting.clear();
-    followed.clear();
     returns(fn, new GraphQLNonNull(result), "", false);
   }
 
