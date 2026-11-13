@@ -160,6 +160,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
   const generic = (type) =>
     Boolean(type.flags & ts.TypeFlags.InstantiableNonPrimitive) || (type.isIntersection() && type.types.some(generic));
   const unchecked = (type) => Boolean(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) || generic(type);
+  const members = (type) => (type.isUnion() ? type.types : [type]);
+  const isUndefined = (type) => Boolean(type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void));
 
   const unwrap = (node) => (ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node);
 
@@ -186,7 +188,9 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
     if (!direct || !ts.isBinaryExpression(assignment) || assignment.left !== access) return;
     if (assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return;
     const name = ts.isPropertyAccessExpression(access) ? access.name : access.argumentExpression;
-    const key = ts.isIdentifier(name) || ts.isStringLiteralLike(name) ? name.text : undefined;
+    // The key in brackets is its value, when TypeScript knows it, such as `"key"` or a `const` holding it
+    const keyType = ts.isElementAccessExpression(access) && checker.getTypeAtLocation(name);
+    const key = keyType ? (keyType.isStringLiteral() ? keyType.value : undefined) : name.text;
     return key === undefined ? undefined : { key, name, value: assignment.right, node: assignment };
   };
 
@@ -305,6 +309,8 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         if (checkedAs) report(node, `${subject(at)} is typed ${checker.typeToString(type)}, so it can't be checked`, true);
         return;
       }
+      // No value has the type never, such as an element of `[].slice()`
+      if (type.flags & ts.TypeFlags.Never) return;
       if (type.isUnion()) return type.types.forEach((member) => typed(member, expected, at, omittable, node));
       if (type.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) {
         if (isNonNullType(expected) && !omittable) report(node, `${subject(at)} can be undefined, but ${expected} has no default`);
@@ -347,15 +353,20 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
         }
         if ([...bindings].map((binding) => skipChanged(binding, at, node)).some(Boolean)) return;
         const fields = inner.getFields();
-        // A oneOf input object takes exactly one of its fields, which can't be null
+        // A oneOf input object takes exactly one of its fields, which can't be null. The others are left out, or
+        // undefined, which JSON leaves out.
         const fieldType = (field) => (inner.isOneOf ? new GraphQLNonNull(field.type) : field.type);
-        const assignments = ([...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? []).filter(
+        const canOmit = (field) => inner.isOneOf || field.defaultValue !== undefined;
+        const written = ([...assigned.values()].find((candidate) => candidate.object === node)?.assignments ?? []).filter(
           beforeReturn,
         );
-        const assignedKeys = new Set(assignments.map((assignment) => assignment.key));
+        // A write that a later one to the same key always replaces isn't returned, and neither is a property one replaces
+        const assignments = written.filter(
+          (assignment, index) => !written.slice(index + 1).some((later) => later.key === assignment.key && later.always),
+        );
+        const replaced = new Set(assignments.filter((assignment) => assignment.always).map((assignment) => assignment.key));
         for (const property of properties) {
-          // A property assigned after the object is created is checked with its assignments
-          if (assignedKeys.has(property.name)) continue;
+          if (replaced.has(property.name)) continue;
           const field = fields[property.name];
           const key = join(at, property.name);
           // A property written in an object literal is followed to its value, keeping literal types (like an enum
@@ -371,21 +382,35 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
             const binding = bindingOf(property);
             if (binding) followed.add(binding);
             const initializer = ts.isPropertyAssignment(assignment) ? assignment.initializer : assignment.name;
-            value(initializer, fieldType(field), key, field.defaultValue !== undefined);
+            value(initializer, fieldType(field), key, canOmit(field));
           } else {
-            typed(checker.getTypeOfSymbol(property), fieldType(field), key, field.defaultValue !== undefined, node);
+            typed(checker.getTypeOfSymbol(property), fieldType(field), key, canOmit(field), node);
           }
         }
         for (const { key, name, value: assignedValue } of assignments) {
           const field = fields[key];
           if (!field) report(name, `${subject(join(at, key))} isn't ${owner(inner)}`);
-          else value(assignedValue, fieldType(field), join(at, key), field.defaultValue !== undefined);
+          else value(assignedValue, fieldType(field), join(at, key), canOmit(field));
         }
-        const keys = new Set([...properties.map((property) => property.name), ...assignedKeys]);
-        if (inner.isOneOf && keys.size !== 1) {
-          const optional = properties.some((property) => property.flags & ts.SymbolFlags.Optional);
-          if (optional && keys.size > 1) report(node, `${subject(at)} may set more than one field of ${inner}, so it can't be checked`, true);
-          else report(node, `${subject(at)} must set exactly one field of ${inner}`);
+        if (inner.isOneOf) {
+          // A field is set where it can't be undefined, and maybe set where it can be
+          const presence = (type, optional) =>
+            members(type).every(isUndefined) ? "no" : optional || members(type).some(isUndefined) ? "maybe" : "yes";
+          const keys = new Set([...properties.map((property) => property.name), ...assignments.map(({ key }) => key)]);
+          const set = [...keys].map((key) => {
+            const writes = assignments.filter((assignment) => assignment.key === key);
+            const possible = writes.map((assignment) => presence(checker.getTypeAtLocation(assignment.value), false));
+            const property = !replaced.has(key) && properties.find((candidate) => candidate.name === key);
+            if (property) possible.push(presence(checker.getTypeOfSymbol(property), property.flags & ts.SymbolFlags.Optional));
+            else if (!replaced.has(key)) possible.push("no");
+            return possible.every((kind) => kind === possible[0]) ? possible[0] : "maybe";
+          });
+          const count = (kind) => set.filter((presence) => presence === kind).length;
+          if (count("yes") > 1 || count("yes") + count("maybe") === 0) {
+            report(node, `${subject(at)} must set exactly one field of ${inner}`);
+          } else if (count("maybe") > 0) {
+            report(node, `${subject(at)} may not set exactly one field of ${inner}, so it can't be checked`, true);
+          }
         }
         for (const [key, field] of Object.entries(fields)) {
           if (!isNonNullType(field.type) || field.defaultValue !== undefined || checker.getPropertyOfType(type, key)) continue;
@@ -422,15 +447,33 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       ts.forEachChild(body, visit);
     };
 
+    // Checks the types `left` can have, apart from the ones `skip` matches, which use `right` instead
+    const orElse = (left, right, skip, expected, at, omittable) => {
+      for (const member of members(checker.getTypeAtLocation(left))) {
+        if (!skip(member)) typed(member, expected, at, omittable, left);
+      }
+      return value(right, expected, at, omittable);
+    };
+
     const value = (node, expected, at, omittable) => {
       const expression = unwrap(node);
       const inner = isNonNullType(expected) ? expected.ofType : expected;
 
       if (ts.isIdentifier(expression)) {
-        const declaration = symbolOf(expression)?.valueDeclaration;
-        // A helper's parameter holds what the call passes for it
-        if (declaration && passed.has(declaration)) return value(passed.get(declaration), expected, at, omittable);
-        if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        const symbol = symbolOf(expression);
+        const declaration = symbol?.valueDeclaration;
+        // A helper's parameter holds what the call passes for it, or its default where that's undefined
+        if (declaration && passed.has(declaration)) {
+          const { argument, initializer } = passed.get(declaration);
+          if (!argument) return value(initializer, expected, at, omittable);
+          if (!initializer || !members(checker.getTypeAtLocation(argument)).some(isUndefined)) {
+            return value(argument, expected, at, omittable);
+          }
+          return orElse(argument, initializer, isUndefined, expected, at, omittable);
+        }
+        // A use a check narrows, such as `x` in `typeof x === "string" ? x : …`, is checked as its narrowed type
+        const narrowed = symbol && checker.getTypeAtLocation(expression) !== checker.getTypeOfSymbol(symbol);
+        if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer && !narrowed) {
           followed.add(declaration);
           checkedReferences.add(expression);
           if (skipChanged(declaration, at, unwrap(declaration.initializer))) return;
@@ -446,13 +489,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
       ) {
         // `??` uses the left side unless it's null or undefined, and `||` only when it's truthy
         const or = expression.operatorToken.kind === ts.SyntaxKind.BarBarToken;
-        const left = checker.getTypeAtLocation(expression.left);
-        for (const member of left.isUnion() ? left.types : [left]) {
-          if (member.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)) continue;
-          if (or && (member === checker.getFalseType() || ((member.isStringLiteral() || member.isNumberLiteral()) && !member.value))) continue;
-          typed(member, expected, at, omittable, expression.left);
-        }
-        return value(expression.right, expected, at, omittable);
+        const falsy = (member) =>
+          member === checker.getFalseType() || ((member.isStringLiteral() || member.isNumberLiteral()) && !member.value);
+        const skip = (member) => isUndefined(member) || Boolean(member.flags & ts.TypeFlags.Null) || (or && falsy(member));
+        return orElse(expression.left, expression.right, skip, expected, at, omittable);
       } else if (ts.isCallExpression(expression)) {
         const fn = functionOf(checker.getResolvedSignature(expression)?.declaration);
         // A generic helper is checked by what its call returns, where its type parameters are known
@@ -461,8 +501,10 @@ function prepareVariablesProblems({ directory, entry: entryPath, schema: schemaP
           visiting.add(fn);
           const spread = expression.arguments.some(ts.isSpreadElement);
           fn.parameters.forEach((parameter, index) => {
-            const argument = expression.arguments[index] ?? parameter.initializer;
-            if (!spread && argument && ts.isIdentifier(parameter.name) && !parameter.dotDotDotToken) passed.set(parameter, argument);
+            const argument = expression.arguments[index];
+            const { initializer } = parameter;
+            if (spread || !ts.isIdentifier(parameter.name) || parameter.dotDotDotToken || !(argument || initializer)) return;
+            passed.set(parameter, { argument, initializer });
           });
           returns(fn, expected, at, omittable);
           fn.parameters.forEach((parameter) => passed.delete(parameter));

@@ -173,6 +173,11 @@ describe("prepareVariablesProblems", () => {
     assert.deepEqual(selector(`{id: '1', handle: 'x'}`), ["`variables.selector` must set exactly one field of Selector"]);
     assert.deepEqual(selector(`{}`), ["`variables.selector` must set exactly one field of Selector"]);
     assert.deepEqual(selector(`{id: null}`), ["`variables.selector.id` can be null, but ID! can't"]);
+    assert.deepEqual(selector(`{id: '1', handle: undefined}`), []);
+    assert.deepEqual(selector(`{id: undefined, handle: undefined}`), ["`variables.selector` must set exactly one field of Selector"]);
+    assert.deepEqual(selector(`{id: input.a ? '1' : undefined, handle: 'x'}`), [
+      "warning: `variables.selector` may not set exactly one field of Selector, so it can't be checked",
+    ]);
   });
 
   test("treats an array element as possibly undefined", () => {
@@ -183,6 +188,23 @@ describe("prepareVariablesProblems", () => {
       }),
       ["`variables.handle` can be undefined, but String! has no default"],
     );
+  });
+
+  test("keeps the narrowing of a variable where it's used", () => {
+    const narrowed = (body) =>
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": `export function cartValidationsGeneratePrepare(input: {handle?: string}) {\nconst handle = input.handle\n${body}\n}`,
+      });
+    assert.deepEqual(narrowed(`return {variables: {handle: typeof handle === 'string' ? handle : 'fallback'}}`), []);
+    assert.deepEqual(narrowed(`if (handle) return {variables: {handle}}\nreturn {variables: {handle: 'b'}}`), []);
+    assert.deepEqual(narrowed(`return {variables: {handle}}`), ["`variables.handle` can be undefined, but String! has no default"]);
+    assert.deepEqual(narrowed(`return {variables: {handle: notDeclared}}`), ["warning: `variables.handle` is typed any, so it can't be checked"]);
+  });
+
+  test("accepts an empty list typed never[]", () => {
+    const files = { "index.js": "export * from './prepare.ts'", "prepare.ts": "export function cartValidationsGeneratePrepare() { return {variables: {handle: 'a', rules: [].slice()}} }" };
+    assert.deepEqual(check(files), []);
   });
 
   test("trusts non-null assertions", () => {
@@ -317,6 +339,14 @@ describe("prepareVariablesProblems", () => {
     ]);
   });
 
+  test("uses the value of a key in brackets", () => {
+    const assigned = (lines) => check(prepare(`const variables = {}\n${lines}\nreturn {variables}`));
+    assert.deepEqual(assigned(`const key = 'handle'\nvariables[key] = 'a'`), []);
+    assert.deepEqual(assigned(`let key = 'handle'\nvariables[key] = 'a'`), [
+      "warning: `variables` is changed or passed on after it's created, so it can't be checked",
+    ]);
+  });
+
   test("warns about a required variable that's only set on some paths", () => {
     const assigned = (lines) => check(prepare(`const variables = {}\n${lines}\nreturn {variables}`));
     assert.deepEqual(assigned(`variables.handle = 'a'`), []);
@@ -326,6 +356,14 @@ describe("prepareVariablesProblems", () => {
     ]) {
       assert.deepEqual(assigned(lines), ["warning: `variables.handle` is only set on some paths, so it can't be checked"], lines);
     }
+  });
+
+  test("checks the writes to a key that can be returned", () => {
+    const built = (lines) => check(prepare(`${lines}\nreturn {variables}`));
+    assert.deepEqual(built(`const variables = {}\nvariables.handle = null\nvariables.handle = 'a'`), []);
+    assert.deepEqual(built(`const variables = {}\nif (input.a) variables.handle = null\nvariables.handle = 'a'`), []);
+    assert.deepEqual(built(`const variables = {}\nvariables.handle = 'a'\nvariables.handle = null`), ["`variables.handle` can be null, but String! can't"]);
+    assert.deepEqual(built(`const variables = {handle: null}\nif (input.a) variables.handle = 'a'`), ["`variables.handle` can be null, but String! can't"]);
   });
 
   test("only checks assignments that can change what's returned", () => {
@@ -357,6 +395,17 @@ describe("prepareVariablesProblems", () => {
       }),
       [],
     );
+  });
+
+  test("uses a helper's default where its argument is undefined", () => {
+    const build = (call) =>
+      check({
+        "index.js": "export * from './prepare.ts'",
+        "prepare.ts": `function build(handle = 'a') { return {handle} }\nexport function cartValidationsGeneratePrepare(input: {h?: string, n?: number}) { return {variables: ${call}} }`,
+      });
+    assert.deepEqual(build(`build(undefined)`), []);
+    assert.deepEqual(build(`build(input.h)`), []);
+    assert.deepEqual(build(`build(input.n)`), ["`variables.handle` must be String!, not number"]);
   });
 
   test("checks a generic helper by what its call returns", () => {
